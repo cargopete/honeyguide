@@ -1,0 +1,20 @@
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Session logs are the eval corpus, but they contain project source verbatim.
+# Kept local by default; export deliberately.
+/.honeyguide/sessions/
+
+# Overlay working copies created by the compile gate.
+/.honeyguide/overlay/
+
+# The index itself is committed (RFC-0001 §5) apart from the SCIP database,
+# which is a build artifact and regenerates in seconds.
+.agent-index/scip.sqlite
+.agent-index/*.scip
+
+.DS_Store
+
+__pycache__/
+*.pyc

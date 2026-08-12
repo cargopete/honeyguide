@@ -1,0 +1,51 @@
+# honeyguide.toml - project-root configuration. Every key is optional; the values
+# shown are the defaults that `hg` applies when the key is absent.
+#
+# Copy to `honeyguide.toml` and edit. See docs/rfcs/RFC-0001-honeyguide.md §11.
+
+[llm]
+# "ollama" is the only backend in v0.1. "llama-server" is planned (RFC-0001 §8.1).
+backend = "ollama"
+url     = "http://pepe-thinkpad:11434"
+model   = "heretic:latest"
+
+[llm.params]
+# Sent explicitly on every request. The model's GGUF metadata advertises
+# temp=1.0/top_k=20/top_p=0.95, and the Ollama Modelfile carries no PARAMETER
+# lines, so without these we would silently inherit Ollama's own defaults.
+temperature = 0.3
+top_p       = 0.95
+top_k       = 20
+min_p       = 0.05
+
+# num_ctx is sent per-request. Ollama's 4096 default is the single most common
+# cause of "the model can't use tools" in the wild; hg refuses to start if the
+# server will not honour at least min_ctx. See RFC-0001 §8.4.
+num_ctx = 32768
+min_ctx = 16384
+
+# Hard cap on generated tokens per phase. At ~13 tok/s a runaway string costs
+# real wall-clock, so this is a wall-clock budget, not a safety margin.
+num_predict_reason = 512
+num_predict_action = 768
+
+[index]
+# Path to the Claude Code CLI used for the semantic pass. If absent, or if
+# `hg index --no-llm` is passed, hg degrades to structural-only (RFC-0001 §5.1).
+claude_bin   = "claude"
+claude_model = "opus"
+map_tokens   = 1200
+auto_refresh = "prompt"   # prompt | always | never
+
+[gate]
+check_cmd    = "cargo check"
+auto_approve = false
+max_repairs  = 3
+
+# Upper bound on a single search/replace block, in lines. Larger edits bounce
+# with an instruction to split. Prevents the whole-file-rewrite regression.
+max_edit_lines = 200
+
+[escalate]
+# v0.2. Deliberately not built until v0.1 session logs exist to design it from.
+enabled = false

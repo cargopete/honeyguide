@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/hg-core",
+    "crates/hg-index",
+    "crates/hg-llm",
+    "crates/hg-tui",
+]
+
+[workspace.package]
+version    = "0.0.0"
+edition    = "2024"
+license    = "MIT"
+repository = "https://github.com/cargopete/honeyguide"
+rust-version = "1.85"
+
+# No dependencies yet, by design. The crates below carry the RFC-0001 data model
+# and nothing else, so `cargo check` stays offline and instant. Implementation
+# lands at M1 (hg-index) and M2 (hg-core, hg-llm).
