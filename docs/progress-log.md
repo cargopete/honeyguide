@@ -2,6 +2,49 @@
 
 Newest first. One entry per meaningful slice of work.
 
+## 2026-08-12 (later still) - the prompt and schema, and what the schema cannot do
+
+Wrote the two artifacts M0 actually runs on, `prompts/system.md` and
+`prompts/action-schema.json`, then tested them against the model rather than
+trusting them. Both were wrong.
+
+The system prompt measures **410 tokens** against the ~700 budgeted, which is
+fine. The schema was broken twice over.
+
+**What Ollama's constrained decoding enforces**, tested: valid JSON, the
+property whitelist, `enum` values, `maxLength`, and the top-level `required`
+list. **Not** property order, and **not** `required` inside `anyOf` branches.
+
+So per-tool argument requirements cannot be expressed in the schema. With
+`required` set to `["reasoning","tool"]` the model emitted `tool: "edit"`
+carrying neither `search` nor `replace`. The textbook fix, `anyOf` discriminated
+on a `const` tool value, came back worse: `{"tool": "edit"}` alone, dropping
+even `reasoning`.
+
+The fix is to require every string field and let unused ones come back empty.
+The obvious objection is that forcing `search` and `replace` invites fabrication
+on a turn where nothing has been read, so that was tested directly: on a cold
+turn the model chose `read` and emitted both as empty strings, and on the edit
+turn it produced a complete correct rename in 79 output tokens against the 125
+the under-constrained version spent inventing fields it had no use for.
+
+**A claim from earlier today is withdrawn.** RFC-0001 §6 said field order was
+load-bearing, so putting `reasoning` first would make the model reason before
+committing to a tool. Order is not enforced: the same schema produced schema
+order on one run and alphabetised on another. The single-call design survives on
+prefill economics; that particular justification for it does not.
+
+Also found: line-numbered `read` observations force the model to strip a gutter
+we introduced, which is a fabrication risk of our own making. The harness will
+normalise a `\s*\d+\|` prefix away before matching. That is not fuzzy matching,
+which §7 forbids; it is undoing our own formatting.
+
+Host facts corrected while checking there was disk for the model A/B. The
+ThinkPad is a **13th-gen i9-13980HX, 32 threads, 62 GB RAM, ~1 TB free**, not
+the Ryzen 9 5950X on DDR4 the research doc planned against. Everything measured
+so far ran at Ollama's default thread settings, and a hybrid P/E-core CPU is not
+a machine where "threads = physical cores" transfers cleanly.
+
 ## 2026-08-12 (later) - RFC-0002, the strong-model boundary
 
 RFC-0001 §5.1 described the semantic half of index generation in one sentence:
