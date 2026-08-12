@@ -347,6 +347,31 @@ here is an observation like any other, and the model gets another turn.
   malformed. It is failing to progress, which is deterministically detectable and
   costs nothing to catch.
 
+**Satisfy, do not refuse, wherever the harness already knows the answer.** M0
+tested the refusal design directly and it failed: told "you have not read this
+file, read it first", the model did not go and read it. It re-sent the identical
+edit eleven times, collecting a refusal each turn until the cap. Twelve turns,
+eighty-nine seconds, nothing achieved, and a perfect 12/12 well-formed action
+rate throughout.
+
+A refusal is only useful to a model that can act on it. This one cannot
+reliably, so any precondition the harness can *satisfy* should be satisfied
+instead:
+
+| Precondition | Old behaviour | Revised |
+|---|---|---|
+| `edit` on an unread path | refuse, "read it first" | return the file contents, note the edit was not applied, invite a retry |
+| identical action repeated | refuse each time | refuse, and **abort the turn after three**, rather than burning the cap |
+| missing required arguments | refuse, naming them | unchanged; nothing to satisfy |
+
+With that change plus §5.3 pre-loading, the same task went from twelve turns and
+no edit to five turns and a clean first-apply pass.
+
+The generalisation is worth stating because it cuts against the instinct: a
+deterministic guardrail should where possible hand the model what it was missing,
+not tell it what it did wrong. Correction assumes a model that can act on
+feedback. Provision assumes nothing.
+
 The last rule is the clearest illustration of the whole thesis. The chosen model
 scored 0/3 where the control scored 2/3, and the gap is not a quality the
 harness has to hope for. It is a loop failure the harness can simply refuse to
