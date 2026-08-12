@@ -250,10 +250,21 @@ prefix extension, and the prefix cache on this model does not serve extensions
 seconds of a turn instead of 80. Paying to double the dominant cost, in order to
 recover a fraction of a reasoning benchmark, is not a trade worth making.
 
-Instead: one call, with `reasoning` as the first field of the schema and a
-`maxLength` on it. The model still emits its reasoning before it commits to a
-tool, which is most of what phase separation buys, and it costs one prefill.
-Field order in the schema is load-bearing here rather than cosmetic.
+Instead: one call, emitting a single flat action object that carries a bounded
+`reasoning` field alongside the call itself. It costs one prefill.
+
+Revision 2 of this section claimed that putting `reasoning` first in the schema
+would make the model reason before committing to a tool, and that field order
+was therefore load-bearing. **That claim is withdrawn: schema property order is
+not enforced.** Measured across runs, the same schema produced output in schema
+order once and alphabetised order another time. What is enforced is the
+top-level `required` list, and that is the only lever the schema offers (§6.3).
+
+So the honest position is weaker than revision 2's. The reasoning tokens are
+generated in the same completion as the action, which is worth something, but
+there is no guarantee they precede the tool choice. If M0 shows this costing
+accuracy, the fallback is not two-phase generation, which the prefill economics
+still forbid, but a shorter action surface and a longer `reasoning` bound.
 
 Two-phase generation stays in the design for any backend where partial prefix
 reuse works, which means a pure-attention model or llama-server with slot reuse.

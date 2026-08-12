@@ -8,6 +8,21 @@ where a figure is a single sample it says so.
 **Client:** MacBook (M3 Pro), so network round-trip is included in every wall
 figure and is negligible against the numbers below.
 
+**The host**, inspected over SSH rather than assumed. The research doc planned
+against a Ryzen 9 5950X desktop on DDR4; it is not that machine.
+
+| | |
+|---|---|
+| CPU | 13th Gen Intel Core i9-13980HX, 32 threads |
+| RAM | 62 GB total, ~48 GB available |
+| Disk | 1.9 TB, ~1 TB free |
+| Inference | CPU only |
+
+A hybrid P-core/E-core laptop CPU is worth noting for anyone tuning thread
+counts later: the usual "set threads to physical cores" advice assumes uniform
+cores, and 32 threads here are not 32 equal ones. Untuned so far; every figure
+below is at Ollama's defaults.
+
 ## 1. Identity
 
 From `/api/show` GGUF metadata.
@@ -226,11 +241,34 @@ during decoding, whereas `format` is enforced. Native calling would have given
 us a well-chosen tool with unbounded arguments. §2 is what unbounded arguments
 look like.
 
-## 6. What was not measured
+## 6. Schema enforcement
 
-- **Threads, RAM speed, and CPU model of the ThinkPad.** Not inspected. The
-  figures above are what the client sees, which is what the harness has to plan
-  against, but they are not attributable to a specific bottleneck yet.
+What Ollama's `format` constraint actually guarantees, tested directly because
+the design rests on it.
+
+| Property | Enforced |
+|---|---|
+| Valid JSON, property whitelist, `enum`, `maxLength` | yes |
+| Top-level `required` list | yes |
+| Property order | **no** |
+| `required` inside `anyOf` branches | **no** |
+
+Consequences, and the evidence, are written up in
+[`prompts/README.md`](../../prompts/README.md). The short version: per-tool
+argument requirements cannot be expressed in the schema, so `required` lists
+every string field and unused ones come back empty. An `anyOf` schema
+discriminated on a `const` tool value returned `{"tool": "edit"}` and nothing
+else, dropping even `reasoning`.
+
+Also measured here: the system prompt at `prompts/system.md` costs **410
+tokens**, against the ~700 budgeted in RFC-0001 §8.5.
+
+## 7. What was not measured
+
+- **Thread tuning.** The host is a hybrid P/E-core i9-13980HX with 32 threads,
+  and everything above ran at Ollama's defaults. The standard "threads =
+  physical cores" advice does not transfer cleanly to asymmetric cores, and
+  nobody has tried.
 - **`ik_llama.cpp` or llama-server as an alternative backend.** RFC-0001 §8.1
   expects a meaningful improvement on this architecture. Unmeasured.
 - **FACP for this model.** The whole point of M0. Nothing here says whether the
