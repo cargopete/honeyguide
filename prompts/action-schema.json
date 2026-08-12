@@ -1,0 +1,46 @@
+{
+  "$comment": "The action object for one ReAct turn. RFC-0001 §6.1 and §6.3. Flat by design: no nesting, every string bounded. Note `required` lists every string field, including ones the chosen tool does not use. That is deliberate and measured: Ollama's constrained decoding enforces the top-level `required` list and nothing else useful, so it is the only way to guarantee an `edit` carries its `replace`. Irrelevant fields come back as empty strings and the harness ignores them. See prompts/README.md.",
+  "type": "object",
+  "properties": {
+    "reasoning": {
+      "type": "string",
+      "maxLength": 400,
+      "$comment": "Two sentences. Bounded because latency is output length and this is paid on every turn."
+    },
+    "tool": {
+      "type": "string",
+      "enum": ["read", "search", "edit", "check", "finish"]
+    },
+    "path": {
+      "type": "string",
+      "maxLength": 200
+    },
+    "start": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "end": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "query": {
+      "type": "string",
+      "maxLength": 120
+    },
+    "search": {
+      "type": "string",
+      "maxLength": 3000,
+      "$comment": "The bound that stops the failure observed on the very first request ever sent to the model: an unbounded string run until it hit the token cap. 3000 characters is roughly 75 lines of Rust."
+    },
+    "replace": {
+      "type": "string",
+      "maxLength": 6000
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 600
+    }
+  },
+  "required": ["reasoning", "tool", "path", "query", "search", "replace", "summary"],
+  "additionalProperties": false
+}
