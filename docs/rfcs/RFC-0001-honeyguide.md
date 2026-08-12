@@ -4,37 +4,47 @@
 |---|---|
 | Status | draft |
 | Author | Pete / Nixum |
-| Revision | 2 (2026-08-12) |
+| Revision | 3 (2026-08-12) |
 | Depends on | `docs/research/2026-08-local-model-tui-coding-agent.md` |
-| Evidence | `docs/measurements/2026-08-12-heretic-thinkpad.md` |
+| Evidence | `docs/measurements/2026-08-12b-clean-rerun.md` |
 | Target | v0.1 (index + local loop), v0.2 (escalation) |
 
 ## Revision note
 
-Revision 1 was written against an assumed target of Qwen3-Coder-30B-A3B on a
-local Ryzen box, with llama-server and GBNF as the preferred serving path. The
-actual target was then probed and is materially different, so the following
-sections changed:
+Revision 1 assumed Qwen3-Coder-30B-A3B on a local Ryzen box with llama-server
+and GBNF. Revision 2 replaced that with measurements of the real target.
+**Revision 3 exists because most of revision 2's measurements were wrong.**
 
-- **§8.2** The driver is `heretic:latest` on `pepe-thinkpad` over Tailscale:
-  `Qwen3.6-35B-A3B-uncensored-heretic`, Q4_K_M, a hybrid SSM/attention MoE. It
-  is not a Coder model and carries no agentic fine-tune.
-- **§8.1** Ollama is the primary backend, not the fallback. That removes GBNF
-  and chat-template control from the design and puts JSON-schema constraint in
-  their place.
-- **§8.3** New. Measured serving numbers replace the research doc's estimates.
-- **§8.5** Rewritten twice. Prefill, not generation, is the constraint that
-  shapes the prompt. The KV prefix cache then turned out not to serve extended
-  prefixes at all, which withdrew the append-only rule and cut the prompt budget
-  from ~17.7k tokens to ~4k.
-- **§6** Two-phase generation is out. It costs a second full prefill for a
-  fraction of a reasoning benchmark. One constrained call per turn, with
-  `reasoning` as the first schema field.
-- **§6.3, §7** Two new deterministic rules, both of which the very first probe
-  request would have needed: read-before-edit, and bounded action strings.
-- **§9** The strong model is Opus 5 via `claude -p`.
-- **§15** Q1 is answered. Q5 is new, and asks whether a hybrid SSM model is
-  simply the wrong shape for an agent loop.
+The morning's probes ran unwarmed, minutes apart, under Ollama's default
+five-minute `keep_alive`, so the model was unloading between them and reload
+time was landing inside `prompt_eval_duration`. That made the machine look five
+to eight times slower than it is, and made a working prefix cache look like a
+broken one. Two clean architectural arguments were built on those numbers, and
+both are withdrawn:
+
+- **Withdrawn: "prefill is the binding cost."** Decode is, by roughly 14x per
+  token. §8.3, §8.5.
+- **Withdrawn: "a hybrid SSM cannot reuse a prefix incrementally."** It reuses
+  fine, 3/3 on a controlled re-run. §8.3, Q1.
+- **Withdrawn: "field order in the schema is load-bearing."** Order is not
+  enforced at all. §6.
+- **Restored:** two-phase generation (§6) and a generous context budget (§8.5),
+  both of which revision 2 cut on the strength of the bad numbers.
+
+What survives from revision 2 is everything that came from *behaviour* rather
+than *timing*: the model fabricating a whole file when asked to edit one it had
+not read, the schema enforcement limits, and the tool surface. Behavioural
+findings reproduced; timing findings did not. That is the lesson, and §12 now
+says so.
+
+Standing decisions carried forward:
+
+- **§8.2** The driver is `heretic:latest`: `Qwen3.6-35B-A3B-uncensored-heretic`,
+  Q4_K_M, hybrid SSM/attention MoE. Chosen deliberately and not up for
+  re-litigation; `qwen3-coder:30b` is kept as a control, not a candidate.
+- **§8.1** Ollama is the primary backend, which means JSON-schema constraint
+  rather than GBNF.
+- **§9** The strong model is Opus 5 via `claude -p`. See RFC-0002.
 
 ## 1. Summary
 
@@ -237,49 +247,37 @@ loop:
     if repair_count(current_edit) >= max_repairs: EscalationSuggested, halt, wait
 ```
 
-This is not what revision 1 specified, and the change is forced by measurement.
+Revision 2 collapsed this to a single call, because a second call appeared to
+cost a second full prefill of eighty seconds. It does not. Prefix reuse works
+(§8.3), and phase 2's prompt is phase 1's prompt plus phase 1's output, which is
+exactly the prefix extension the cache serves. Measured, an extension of that
+kind costs **1.65 to 2.96 seconds**, not eighty.
 
-The textbook arrangement is two phases: generate reasoning unconstrained, then
-switch to constrained decoding for the action, so that the 10-30% reasoning tax
-from constrained decoding (Tam et al.) never applies to the thinking. It is the
-right design, and on this hardware we cannot have it.
+So two-phase is restored, and with it the thing it was always for: the model
+reasons in its own trained format, unconstrained, and only the action is forced
+into a schema. That avoids the 10-30% reasoning tax constrained decoding imposes
+(Tam et al.) at a cost of a couple of seconds a turn.
 
-Phase 2's prompt is phase 1's prompt plus phase 1's output, which is a strict
-prefix extension, and the prefix cache on this model does not serve extensions
-(§8.3). So two phases means two full prefills, and at 5k context that is 160
-seconds of a turn instead of 80. Paying to double the dominant cost, in order to
-recover a fraction of a reasoning benchmark, is not a trade worth making.
+Revision 2 also claimed that putting `reasoning` first in a single flat object
+would recover most of this. **That claim is withdrawn**: schema property order is
+not enforced, and the same schema produced schema order on one run and
+alphabetised order on another. There was never a guarantee that the reasoning
+preceded the tool choice.
 
-Instead: one call, emitting a single flat action object that carries a bounded
-`reasoning` field alongside the call itself. It costs one prefill.
-
-Revision 2 of this section claimed that putting `reasoning` first in the schema
-would make the model reason before committing to a tool, and that field order
-was therefore load-bearing. **That claim is withdrawn: schema property order is
-not enforced.** Measured across runs, the same schema produced output in schema
-order once and alphabetised order another time. What is enforced is the
-top-level `required` list, and that is the only lever the schema offers (§6.3).
-
-So the honest position is weaker than revision 2's. The reasoning tokens are
-generated in the same completion as the action, which is worth something, but
-there is no guarantee they precede the tool choice. If M0 shows this costing
-accuracy, the fallback is not two-phase generation, which the prefill economics
-still forbid, but a shorter action surface and a longer `reasoning` bound.
-
-Two-phase generation stays in the design for any backend where partial prefix
-reuse works, which means a pure-attention model or llama-server with slot reuse.
-`hg_llm::Phase` exists for that reason. It is dormant, not deleted.
+The single-call form is kept as a fallback for backends without prefix reuse,
+and the schema still carries a bounded `reasoning` field so a single call
+degrades gracefully. `hg_llm::Phase` models both.
 
 `think: false` is sent on every request. The model advertises a thinking
-capability, and a hybrid reasoning model left to its own devices will spend
-hundreds of tokens deliberating before it says anything, at 13 tok/s. The
-`reasoning` field is the deliberation budget, and it is ours to cap.
+capability, and left alone a hybrid reasoning model will deliberate for hundreds
+of tokens before saying anything. At 25 tok/s that is real time. Phase 1 is the
+reasoning budget and it is ours to cap.
 
-**Turns are the unit of cost.** Every turn pays a full prefill, so the way to
-make a session fast is not to shave tokens but to remove round-trips. This is
-the strongest argument in the document for the index: a `read` turn that the
-harness could have pre-empted by loading the blast radius is a minute and a half
-that the user waits for information we already had on disk.
+**Output is the expensive part.** At 359 tok/s of prefill against 25.3 of
+decode, a generated token costs about fourteen prompt tokens. Every cap on
+reasoning length and every truncated observation is worth fourteen times its
+weight in context, and that, not context size, is where a turn's wall-clock
+goes.
 
 ### 6.1 Tool surface
 
@@ -313,10 +311,14 @@ Edits never touch the working tree directly.
 4. On failure, emit `EditBounced`, feed the rustc errors back verbatim as the
    observation, and increment the repair count.
 
-`cargo check` on a warm target directory for a small project takes 1 to 5
-seconds. A single model turn takes considerably longer than that. The gate is
-therefore both the primary quality mechanism and the cheapest thing in the loop;
-everything else is context plumbing.
+Measured against the M0 target: a real change in `dipper`'s core crate
+cascades to all four dependent crates and `cargo check --workspace` completes in
+**0.77s** on a warm target directory (21.7s cold, 0.30s with nothing changed).
+A six-turn model loop on the same task takes about fifty seconds.
+
+The gate is therefore both the primary quality mechanism and, by roughly two
+orders of magnitude, the cheapest thing in the loop. Everything else is context
+plumbing.
 
 ### 6.3 Deterministic preconditions
 
@@ -337,6 +339,18 @@ here is an observation like any other, and the model gets another turn.
 - **Truncation is fatal, not repairable.** If generation stopped at the token
   cap, the action is discarded rather than parsed. Half a JSON object tells you
   nothing, and guessing the rest is how harnesses corrupt files.
+- **No stalling.** An action identical to the previous one on the same target is
+  refused, with the observation "you already did this; here is what you got, now
+  act on it". This exists because of the driver's measured failure mode: given a
+  file it had already been shown and asked to rename a method, it chose `read`
+  again, three times out of three (§8.3). It is not fabricating and it is not
+  malformed. It is failing to progress, which is deterministically detectable and
+  costs nothing to catch.
+
+The last rule is the clearest illustration of the whole thesis. The chosen model
+scored 0/3 where the control scored 2/3, and the gap is not a quality the
+harness has to hope for. It is a loop failure the harness can simply refuse to
+allow.
 
 ## 7. Edit format
 
@@ -405,53 +419,54 @@ makes measuring it a deliverable rather than a hope.
 
 ### 8.3 Measured baseline
 
-Measured against `pepe-thinkpad` on 2026-08-12. Full method and raw output in
-`docs/measurements/2026-08-12-heretic-thinkpad.md`.
+Measured against `pepe-thinkpad` on 2026-08-12, three trials of each figure
+against a warmed model with fresh content. Method and raw output in
+[`docs/measurements/2026-08-12b-clean-rerun.md`](../measurements/2026-08-12b-clean-rerun.md).
 
-| Quantity | Measured |
-|---|---|
-| Decode | 13.0 tok/s |
-| Prefill, 5.1k prompt | 66 tok/s (77.2s) |
-| Prefill, 15.4k prompt | 40 tok/s (383.7s) |
-| Cold load | 26.1s |
-| Prompt above `num_ctx` | HTTP 400, rejected rather than truncated |
-| Schema-constrained emission | valid, first attempt, field order respected |
-| Native tool call, 3 tools | correct tool, correct argument, no content leakage |
-| KV prefix cache, identical prompt | 77.2s becomes 0.2s |
-| KV prefix cache, prompt extended by 6 tokens | 81.7s, a full recompute |
-| Same test, `qwen3:8b` (pure attention, same host) | extension costs **1.2s** |
+An earlier revision of this section carried figures that were five to eight
+times worse and a prefix-cache finding that was simply wrong. Both came from
+unwarmed probes minutes apart, where model reload time was being folded into
+`prompt_eval_duration`. The superseded document is kept, marked, because the
+architectural reasoning built on it was tidy and confident and entirely
+unfounded.
 
-Two of those lines carry the design.
+| Quantity | `heretic:latest` | `qwen3-coder:30b` (control) |
+|---|---|---|
+| Prefill, median of 3 | **359 tok/s** | 467 tok/s |
+| Decode, median of 3 | **25.3 tok/s** | 19.5 tok/s |
+| Incremental prefix reuse | **3/3 yes** | 3/3 yes |
+| Six-turn wall clock | **49.9s, 50.5s** | 56.9s, 52.5s |
+| Complete + correct edit | **0/3** | 2/3 |
+| Cold load | ~26s | ~18s |
+| Prompt above `num_ctx` | HTTP 400, rejected rather than truncated | |
 
-**Prefill is the binding cost, and it gets worse with length.** It runs at
-roughly three to five times decode, but it degrades from 66 tok/s at 5k to 40
-tok/s at 15k. Prompt processing on a bandwidth-bound CPU MoE is not the cheap,
-parallel phase it is on a GPU.
+The host carries an 8 GB RTX 2000 Ada that Ollama partially offloads to
+(`68%/32%` CPU/GPU), which is most of why these figures are healthier than a
+pure-CPU estimate would suggest.
 
-**The prefix cache is exact-match only, and it is the model's fault.** An
-identical prompt is free. A prompt extended by six tokens is a full recompute. A
-control run against `qwen3:8b` on the same server in the same minute reuses the
-prefix incrementally and pays 1.2 seconds for a five-token extension, so Ollama
-is willing and able; this model cannot be served that way. A hybrid SSM carries
-one rolling recurrent state rather than a per-token cache, so there is no
-position to rewind to.
+Three things follow.
 
-That finding is the expensive one, and §6 and §8.5 are written around it. It
-also outranks everything else in this document, including the abliteration
-question: over a ten-turn session, a pure-attention model of the same class pays
-one full prefill and then seconds, while this one pays minutes every turn. The
-recommendation, offered once and then set aside because the driver is chosen
-(§8.2), is that Q4's A/B should be run early and judged on wall-clock first.
+**Decode is the binding cost, not prefill.** At 359 tok/s against 25.3, one
+generated token costs about fourteen prompt tokens. The lever is how much the
+model *writes*, not how much it reads. Every bound on `reasoning`, every
+truncated observation, every terse summary is worth roughly fourteen times its
+weight in context.
 
-The working figure for planning is:
+**Prefix reuse works**, so a frozen prefix is paid once per session rather than
+once per turn:
 
 ```
-turn_seconds  ~=  prompt_tokens / 50  +  generated_tokens / 13
+first turn   ~=  prompt_tokens / 360  +  generated_tokens / 25
+later turns  ~=  new_tokens_only / 360  +  generated_tokens / 25
 ```
 
-Every token in the frozen prefix therefore costs about 20ms **on every turn**,
-not once. A 1,200-token repo map is 24 seconds of every turn a session ever
-takes. That is the budget the index has to justify itself against.
+**heretic is the faster model end to end**, which is counterintuitive and worth
+stating. `qwen3-coder` prefills 30% faster, `heretic` decodes 30% faster, decode
+dominates, and heretic finishes a six-turn task in about 50 seconds against 52
+to 57. The chosen driver costs nothing in speed.
+
+What it does cost is quality: 0/3 complete correct edits against the control's
+2/3, on an identical task. §6.3 addresses the specific way it fails.
 
 ### 8.4 Serving preflight
 
@@ -477,51 +492,48 @@ Results are shown by `/model`.
 
 ### 8.5 Context budget and prompt discipline
 
-The context budget is not about what the model can hold. It is about what we can
-afford to send, **every single turn**.
+Revision 2 cut this budget from ~17.7k tokens to ~4k, on the belief that every
+token in the prefix was re-ingested at 50 tok/s on every single turn. Prefix
+reuse works and prefill runs at 359 tok/s, so that belief was wrong twice over
+and the budget is restored.
 
-Revision 1 assumed a 32k working window and an append-only discipline that would
-let the prefix cache absorb most of the cost. The cache does not work that way
-here (§8.3), so there is no absorbing it: each turn pays
-`prompt_tokens / 50` seconds before the model says a word.
+| Slice | Budget | Cost, first turn only |
+|---|---|---|
+| System prompt and tool semantics | ~1k (measured: 410 for the prompt itself) | 3s |
+| `AGENTS.md` | ~1k | 3s |
+| `repomap.txt` | ~1.2k | 3s |
+| Task index slice: signatures and summaries | ~2.5k | 7s |
+| Function bodies in the blast radius | ~5k | 14s |
+| History and observations | ~6k, truncated per tool | grows |
+| **Total prompt** | **~16k** | **~45s, once** |
 
-That reframes the budget as a wall-clock allowance. At a target of roughly 90
-seconds per turn, of which generation takes 15 to 25, the prompt has to come in
-under about 4k tokens.
+Forty-five seconds to load a session's context, paid on the first turn and then
+served from cache, is a fair price for an index rich enough to stop the model
+guessing. Q3, whether the repo map earns its 1,200 tokens, is now a question
+about whether a weak model is confused by it rather than about seconds.
 
-| Slice | Rev 1 | Rev 2 | Cost per turn at 50 tok/s |
-|---|---|---|---|
-| System prompt and tool semantics | ~1.5k | ~700 | 14s |
-| `AGENTS.md` | ~1k | ~500, the invariants only | 10s |
-| `repomap.txt` | ~1.2k | ~400, or omitted (Q3) | 8s |
-| Task index slice: signatures and summaries | ~2k | ~800 | 16s |
-| Function bodies in the blast radius | ~4k | ~1k, the target function and callers | 20s |
-| History and observations | ~8k | ~600, aggressively truncated | 12s |
-| **Total prompt** | ~17.7k | **~4k** | **~80s** |
+The rules that follow are not the ones revision 2 derived.
 
-Every number in the middle column is a claim that this slice is worth its
-seconds, and the smoke suite is how those claims get tested. The `repomap.txt`
-line is the weakest of them: 400 tokens is 8 seconds of every turn forever, for
-a breadth-first overview that a weak model may not even use well. Q3 now has a
-wall-clock answer to give, not just an accuracy one.
+**The conversation is append-only, and this matters again.** Turn N's prompt
+should be a strict prefix extension of turn N-1's, because the cache serves
+extensions at 1.65 to 2.96 seconds rather than re-ingesting at 45. Revision 2
+withdrew this rule on the strength of a broken measurement. It is reinstated.
 
-Two rules survive from revision 1, for different reasons than before.
+**The prefix is frozen** for the duration of a task. Re-running retrieval
+mid-task rewrites the prefix and throws the cache away, which costs the full 45
+seconds again for a marginally better context.
 
-**The prefix is still frozen**, not to preserve a cache but because re-running
-retrieval mid-task cannot pay for itself: better context does not repay a second
-full prefill in the same session.
+**Compaction is explicit and rare.** It rewrites the prompt, so it forfeits the
+cache and costs a full re-ingest. It happens on `/compact` or at a hard
+threshold, never quietly every turn, and it is deterministic and
+template-driven: files touched, edits applied and bounced with one-line reasons,
+current goal. No LLM summarisation call, because generation is the expensive
+resource here and bookkeeping is not worth 25 tok/s of it.
 
-**Compaction is still explicit.** It is deterministic and template-driven
-(files touched, edits applied and bounced with one-line reasons, current goal),
-with no LLM summarisation call, because at 13 tok/s you do not spend generation
-on bookkeeping. It now has a second justification: compaction that *shrinks* the
-prompt pays for itself immediately, on the very next turn, which makes it
-cheaper here than it would be on a machine with a working prefix cache. This is
-the one place where the bad news makes something better.
-
-The append-only rule from revision 1 is **withdrawn**. It bought prefix-cache
-hits, there are no prefix-cache hits, and it was constraining how observations
-could be merged and truncated for no return.
+**The real lever is output length.** One generated token costs about fourteen
+prompt tokens. Bound the `reasoning` field, truncate observations hard per tool,
+cap summaries. That is where a turn's time actually goes, and it is the one
+place where being stingy pays fourteen to one.
 
 ## 9. Escalation (v0.2)
 
@@ -596,6 +608,36 @@ set: rename a function across the crate; add a struct field and fix all
 constructors; fix a planted failing test; add a `Display` impl; extract a
 function; and three comprehension questions graded by must-mention assertions.
 
+### 12.1 Measurement discipline
+
+Written into the spec because ignoring it cost a whole revision.
+
+**Timing findings are fragile; behavioural findings are not.** Every timing
+number in revision 2 was wrong by five to eight times. Every behavioural
+finding from the same session reproduced exactly: the model fabricating a file
+it had not read, the schema enforcing `required` but not order, the tool
+surface. When a measurement is going to drive an architectural decision, prefer
+the behavioural one.
+
+Rules for any number that enters this document:
+
+1. **Warm the model first.** Ollama can fold model load time into
+   `prompt_eval_duration`, which is what makes a healthy machine look ruined.
+2. **Set `keep_alive` explicitly.** The five-minute default unloads the model
+   between probes taken minutes apart, which is precisely how the above happens.
+3. **Fresh content per trial.** Reusing a filler body silently measures the
+   prefix cache instead of prefill.
+4. **Three trials minimum, and report all of them.** A single sample of anything
+   in this domain is worthless.
+5. **Prefer end-to-end.** A six-turn wall-clock number is hard to fool. A
+   tokens-per-second number is easy to fool and was fooled.
+6. **Record the host state.** Reboots, GPU offload split, and what else was
+   resident. The host rebooted mid-session and nobody noticed for an hour.
+
+`scripts/bench-clean.py` implements 1 through 4. `scripts/serving-probe.py`
+predates the lesson and does not; it is kept for the identity and schema checks,
+which are behavioural.
+
 Run per PR in CI against a pinned model, quant, and serving configuration. The
 Aider polyglot Rust subset is a secondary, occasional benchmark and not CI: too
 slow at local speeds, and harness variance makes cross-leaderboard comparison
@@ -654,40 +696,36 @@ meaningless anyway.
 
 ## 15. Open questions
 
-- **Q1: prefix-cache behaviour across requests. ANSWERED, and badly.** Exact
-  repeats are free (77.2s becomes 0.2s). Extensions are not: six extra tokens
-  cost a full recompute of all 5,142. There is no partial prefix reuse on this
-  model, which is what a single rolling recurrent state implies. Consequences
-  are taken in §6 (one call per turn, not two) and §8.5 (a 4k prompt budget and
-  the withdrawal of the append-only rule). The question this leaves open is
-  narrower, and the control has answered that too: `qwen3:8b` on the same host
-  pays 1.2s for a five-token extension, so it is the architecture, not the
-  server. Nothing about the serving stack will fix it. What remains open is
-  whether llama-server or `ik_llama.cpp` handle recurrent state any better,
-  which is worth an hour before it is worth a model change.
-- **Q2: overlay mechanism.** A `cp -al` hardlink forest is fragile if any tool
-  writes in place. The likely answer is a per-edited-file copy with a shared
-  `--target-dir`, but it needs testing against `cargo check`'s own behaviour.
-- **Q3: does the repo map help or hurt at this scale?** Aider warns that weak
-  models get confused by large maps. There is now a second, sharper form of the
-  question: at 50 tok/s of prefill, a 1,200-token map costs 24 seconds of every
-  turn for the life of the session. Smoke-test at 0, 400, and 1,200 tokens
-  during M2, and require it to earn those seconds rather than merely not hurt.
-- **Q4: heretic against stock Qwen3-Coder-30B-A3B, reframed.** Revision 1 asked
-  a quality question: what does abliteration cost in first-apply pass rate?
-  That still matters and nobody appears to have published it. But Q1 has added a
-  second axis that may dominate. Qwen3-Coder-30B-A3B is a pure-attention MoE, so
-  if partial prefix reuse works for it on the same server, it wins turns that
-  cost seconds against turns that cost minutes, and no plausible quality delta
-  compensates for that. Measure both at M0: FACP, and wall-clock per turn over a
-  realistic multi-turn task. Publish both in the README.
-- **Q5: is a hybrid SSM model simply the wrong shape for an agent loop?** The
-  generalisation of Q4, and the control says probably yes. Recurrent state buys
-  long-context efficiency within a single forward pass and costs incremental
-  prefix reuse across passes. An agent loop is nothing but repeated passes over
-  a slowly growing prefix, which is close to the worst case for that trade.
-  Stated as a selection criterion: **for a local agent loop, prefer a
-  pure-attention MoE over a hybrid SSM MoE of the same active size, and check
-  `ssm.*` in the GGUF metadata before pulling anything.** That belongs somewhere
-  more visible than an RFC, and once M0 has confirmed it on a real task, it
-  should go there.
+Q1, Q4 and Q5 are closed. They are kept rather than deleted because how they
+closed is the most useful thing in this document.
+
+- **Q1: prefix-cache behaviour. CLOSED, yes.** Extensions are served in 1.65 to
+  2.96 seconds against ~18 for a fresh prompt of the same size, 3/3. Revision 2
+  claimed the opposite at length and was measuring an unwarmed model reloading.
+- **Q2: overlay mechanism.** Still open. A `cp -al` hardlink forest is fragile
+  if any tool writes in place; the likely answer is a per-edited-file copy with
+  a shared `--target-dir`. Cheap to settle now that the gate is known to cost
+  0.77s on the M0 target.
+- **Q3: does the repo map help or hurt?** Still open, but now a question about
+  comprehension rather than seconds: 1,200 tokens costs about 3 seconds, once.
+  Aider's warning that weak models are confused by large maps is the live
+  concern. Smoke-test at 0, 400 and 1,200 during M2.
+- **Q4: heretic against a pure-attention control. CLOSED.** Not by argument but
+  by decision: heretic is chosen for capability reasons that sit outside this
+  document, and the measurements no longer contest it. It is *faster* end to end
+  (49.9s against 52-57s on a six-turn task) because decode dominates and it
+  decodes 30% quicker. It is worse on quality, 0/3 complete correct edits against
+  2/3, and §6.3 exists to address the specific way it fails.
+  `qwen3-coder:30b` stays installed as a **control**: when first-apply pass rate
+  drops, re-running the same eval against a pure-attention, non-abliterated model
+  of the same active size and quant is how you tell a model regression from a
+  harness bug. It earned that role by doing exactly that job today.
+- **Q5: is a hybrid SSM the wrong shape for an agent loop? CLOSED, no.** This
+  was built entirely on the withdrawn no-reuse finding. Reuse works, the
+  end-to-end six-turn number favours the hybrid, and the rule of thumb this once
+  proposed ("prefer pure attention, grep the GGUF for `ssm.`") should be
+  disregarded. It was a good rule about a fact that was not true.
+- **Q6: does the §6.3 stall rule close the quality gap?** New, and the one that
+  matters. The driver's failure is repetition rather than fabrication, so a
+  deterministic refusal ought to convert a wasted turn into a corrected one.
+  Untested. M0 answers it.

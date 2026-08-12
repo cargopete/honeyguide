@@ -2,6 +2,57 @@
 
 Newest first. One entry per meaningful slice of work.
 
+## 2026-08-12 (evening) - most of today's measurements were wrong
+
+RFC-0001 revision 3. The morning's throughput and prefix-cache figures did not
+reproduce, and two architectural arguments built on them are withdrawn.
+
+**Cause.** Probes ran unwarmed, minutes apart, under Ollama's default
+five-minute `keep_alive`, so the model was unloading between them and reload
+time was landing inside `prompt_eval_duration`. The host also carries an 8 GB
+RTX 2000 Ada that Ollama partially offloads to (`68%/32%` CPU/GPU), and it
+rebooted at 12:22 between the two runs. The methodology error is the more likely
+explanation and is the one worth fixing.
+
+**Corrected, three trials each, warmed, fresh content:**
+
+| | morning | clean re-run |
+|---|---|---|
+| heretic prefill | 40-66 tok/s | **359 tok/s** |
+| heretic decode | 13.0 tok/s | **25.3 tok/s** |
+| incremental prefix reuse | "none, it is a hybrid SSM" | **works, 3/3** |
+
+**Withdrawn:** "prefill is the binding cost" (decode is, by ~14x per token);
+"a hybrid SSM cannot reuse a prefix incrementally"; "schema field order is
+load-bearing". **Restored:** two-phase generation, append-only prompt
+discipline, and a ~16k context budget, all of which revision 2 cut on the
+strength of the bad numbers.
+
+**The A/B, run against `qwen3-coder:30b` as a same-quant pure-attention
+control.** heretic is *faster* end to end (49.9s and 50.5s against 56.9s and
+52.5s over six turns) because decode dominates and it decodes 30% quicker. It is
+worse on quality: 0/3 complete correct edits against 2/3. Q4 and Q5 close;
+heretic is the committed driver and qwen3-coder stays installed as a control for
+telling model regressions from harness bugs.
+
+**The quality gap has a shape worth having.** Every heretic failure was a valid
+`read` action re-reading a file it had already been shown. It stalls rather than
+fabricates, which is deterministically detectable, so §6.3 gains a no-stalling
+rule and Q6 asks whether that closes the gap. M0 answers it.
+
+**Also measured:** the compile gate on `dipper`, the M0 target, is **0.77s**
+warm after a real core-crate change that cascades to all four dependents (21.7s
+cold). Against a fifty-second model loop, the gate is free.
+
+**The lesson, now RFC-0001 §12.1.** Every timing finding from the morning was
+wrong by up to eight times. Every behavioural finding from the same session
+reproduced exactly: the fabricated file, the schema enforcement limits, the tool
+surface. Timing is fragile, behaviour is not, and architectural decisions should
+lean on the second. `scripts/bench-clean.py` implements the rules.
+
+Repo made public as a public good, with the superseded measurements kept and
+marked rather than deleted.
+
 ## 2026-08-12 (later still) - the prompt and schema, and what the schema cannot do
 
 Wrote the two artifacts M0 actually runs on, `prompts/system.md` and

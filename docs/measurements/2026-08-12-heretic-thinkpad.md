@@ -1,6 +1,32 @@
-# Measurement: `heretic:latest` on `pepe-thinkpad`, 2026-08-12
+# Measurement: `heretic:latest` on `pepe-thinkpad`, 2026-08-12 (morning)
 
-The numbers RFC-0001 is built on. Everything here was produced by
+> ## SUPERSEDED
+>
+> **Do not use the throughput or prefix-cache figures in this document.** They
+> did not reproduce. See
+> [`2026-08-12b-clean-rerun.md`](2026-08-12b-clean-rerun.md) for the numbers
+> that stand.
+>
+> Two findings here are wrong, and both were load-bearing:
+>
+> - **Throughput.** Measured 13 tok/s decode and 40-66 tok/s prefill. The real
+>   figures are ~25 tok/s and ~359 tok/s, five to eight times better.
+> - **"No incremental prefix reuse."** §4 argues at length that a hybrid SSM
+>   cannot reuse a prefix because it carries one rolling recurrent state. It
+>   reuses fine, 3/3 on a controlled re-run.
+>
+> The cause: these probes ran minutes apart, unwarmed, under Ollama's default
+> five-minute `keep_alive`, so the model was unloading between them and load
+> time was being folded into `prompt_eval_duration`. The host also has an 8 GB
+> RTX 2000 Ada that Ollama partially offloads to, and it rebooted at 12:22
+> between this run and the clean one.
+>
+> The document is kept unedited below because the reasoning built on the bad
+> numbers was tidy and confident, and that is the instructive part. A tidy
+> argument on an unverified floor is still wrong. Sections 1, 2 and 5 (model
+> identity, schema behaviour, native tool calling) are unaffected and stand.
+
+The numbers RFC-0001 was originally built on. Everything here was produced by
 `scripts/serving-probe.py` against the live server; nothing is estimated, and
 where a figure is a single sample it says so.
 

@@ -23,6 +23,7 @@ Usage:
 import argparse
 import json
 import time
+import urllib.error
 import urllib.request
 
 HOST = "http://pepe-thinkpad:11434"
@@ -71,6 +72,8 @@ def chat(host, model, messages, schema=None, num_predict=256, num_ctx=32768):
         "model": model,
         "messages": messages,
         "stream": False,
+        # Only meaningful for models that declare a thinking capability. Sending
+        # it to one that does not can be rejected, so we retry without it.
         "think": False,
         "keep_alive": "30m",
         "options": {
@@ -80,7 +83,13 @@ def chat(host, model, messages, schema=None, num_predict=256, num_ctx=32768):
     }
     if schema:
         payload["format"] = schema
-    return post(host, payload)
+    try:
+        return post(host, payload)
+    except urllib.error.HTTPError as e:
+        if e.code != 400:
+            raise
+        payload.pop("think", None)
+        return post(host, payload)
 
 
 def prefill_s(o):

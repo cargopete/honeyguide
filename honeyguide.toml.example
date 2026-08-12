@@ -6,7 +6,9 @@
 [llm]
 # "ollama" is the only backend in v0.1. "llama-server" is planned (RFC-0001 §8.1).
 backend = "ollama"
-url     = "http://pepe-thinkpad:11434"
+# A remote host over Tailscale works fine; latency is negligible against
+# local generation speed. Measurements in docs/ were taken that way.
+url     = "http://localhost:11434"
 model   = "heretic:latest"
 
 [llm.params]
