@@ -2,6 +2,42 @@
 
 Newest first. One entry per meaningful slice of work.
 
+## 2026-08-12 (later) - RFC-0002, the strong-model boundary
+
+RFC-0001 §5.1 described the semantic half of index generation in one sentence:
+shell out to `claude -p` and ask for summaries "against a strict output schema".
+Probing Claude Code 2.1.228 showed that most of that sentence was wrong, so the
+boundary got its own RFC.
+
+**Measured.** A one-word reply costs 4.1s wall, 2.1s API, and **32,740 tokens of
+preamble** (16,754 created plus 15,986 read, `ephemeral_1h`). An agentic call
+that read one file and wrote two took 7 turns, 28.9s, and re-read 220,359 cached
+tokens, so cost scales with `turns x context` rather than with answer length.
+
+**Three things that are not what they look like.**
+
+- **`--allowed-tools` gates tools, not paths.** Invoked with
+  `Write(out/**)`, Claude wrote `out/summary.md` as asked and then also wrote
+  `src/NOTES.md`, outside the pattern, unimpeded, and said so. A `Bash` call in
+  the same run *was* denied, so tool-level gating works fine. Allow rules widen;
+  they do not narrow. The semantic pass therefore gets `Read Grep Glob` and no
+  write capability at all, and hg writes every artifact itself.
+- **`--max-turns` does not exist** in 2.1.228. Since turns are the cost driver,
+  it would have been the obvious lever, and specifying it would have put a
+  config key in front of a flag that is not there.
+- **`--bare` cannot use the Max subscription.** It is the obvious way to shed
+  the 33k preamble, and its own help text closes the door: auth is strictly
+  `ANTHROPIC_API_KEY`, OAuth and keychain are never read.
+
+**Design changes.** One persistent process per index run over
+`--input-format stream-json`, not one per module (fifty modules would otherwise
+spend three and a half minutes purely on spawn, and pay the preamble fifty
+times). No output schema at all: one request per module, one response per
+module, and the framing carries the structure that a schema was being asked to
+carry. And the semantic pass now ships each module's symbol signatures from pass
+1, because making Claude rediscover by grep what SCIP already knows is paying
+for turns to learn something we have on disk.
+
 ## 2026-08-12 - Repository opened, RFC-0001 revised against measurement
 
 Created the repository, archived the research survey unedited, and rewrote

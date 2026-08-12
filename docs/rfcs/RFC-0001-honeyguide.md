@@ -162,13 +162,19 @@ Three passes, in order.
    range)` and `refs(symbol_id, file, range, is_def)`. Then a tree-sitter pass
    builds a symbol graph, PageRank ranks it, and the result is budgeted into
    `repomap.txt`. Then `callgraph.jsonl` is derived from the SCIP references.
-2. **Semantic (Opus 5, optional).** Shell out to `claude -p --model opus
-   --output-format json` with the working directory set to the project root, one
-   invocation per batch of modules. The prompt hands Claude the structural
-   artifacts and asks for `AGENTS.md` plus per-module summaries against a strict
-   output schema. Claude Code explores the repository with its own tools; we do
-   not feed it file contents, because it is better at finding them than we are
-   at guessing which ones matter.
+2. **Semantic (Opus 5, optional).** One persistent `claude -p --model opus`
+   process per index run, fed over `--input-format stream-json`, with the
+   working directory set to the project root and tools restricted to
+   `Read Grep Glob`. One message per module, one response per module. The
+   request carries that module's file paths and symbol signatures from pass 1;
+   Claude reads whichever bodies it wants. `AGENTS.md` is requested last, once
+   every summary is in hand.
+
+   **See RFC-0002.** This boundary has more sharp edges than one bullet can
+   hold: a 33k-token preamble on every invocation, an allow-list that gates
+   tools but not paths, and no structured-output mode at all. Revision 1 of this
+   section specified a "strict output schema", which does not exist, and per-batch
+   invocations, which would pay the preamble over and over.
 3. **Degraded (G4).** If the `claude` binary is absent, or `--no-llm` is passed,
    pass 2 is skipped. `AGENTS.md` is stubbed from `Cargo.toml` metadata and
    detected commands, summaries are omitted, and retrieval falls back to
@@ -182,9 +188,9 @@ The manifest records the git rev each artifact was generated at.
    them the owning modules.
 2. Re-run scip, re-ingest, regenerate the repo map. A full re-index is fine at
    50k LoC.
-3. Re-summarise **only** the changed modules, in a single batched `claude -p`
-   call. Never one call per file: Max rate limits are session-based, so batch or
-   starve.
+3. Re-summarise **only** the changed modules, through a single `claude -p`
+   process (RFC-0002 §3). Never one process per file: each one costs four
+   seconds and a 33,000-token preamble before it has read anything.
 
 At runtime, if `manifest.rev != HEAD` and the changed files intersect the task's
 blast radius, the harness prefixes the context with a one-line staleness warning
@@ -520,12 +526,17 @@ without explicit confirmation, because it spends Max quota.
 
 The package is one `claude -p --model opus` call containing the task, the index
 slices that were in context, every attempted search/replace with its
-diagnostics, and current file contents for the blast radius. The requested
-output, against a strict schema, is either a plan (an ordered edit list with
-rationale, injected into the local loop as an authoritative-plan message, which
-is the plan-injection pattern the research supports) or a direct patch, which
-enters the same compile gate and is provenance-tagged in the transcript and the
-diff view.
+diagnostics, and current file contents for the blast radius. It reuses the
+transport and the containment rules of RFC-0002, with one difference: the user
+is watching, so the 4-second floor and the multi-turn latency are visible rather
+than amortised, and the TUI has to say what it is waiting for.
+
+The output is either a plan (an ordered edit list with rationale, injected into
+the local loop as an authoritative-plan message, which is the plan-injection
+pattern the research supports) or a direct patch, which enters the same compile
+gate and is provenance-tagged in the transcript and the diff view. Which of the
+two is asked for is decided by the harness, not the model, so there is nothing
+to parse: a plan request gets a plan.
 
 ## 10. TUI
 

@@ -20,6 +20,9 @@ specification, the data model in Rust (it compiles, it does nothing), and the
 measurements the specification is built on.
 
 - [`docs/rfcs/RFC-0001-honeyguide.md`](docs/rfcs/RFC-0001-honeyguide.md) is the design.
+- [`docs/rfcs/RFC-0002-strong-model-boundary.md`](docs/rfcs/RFC-0002-strong-model-boundary.md)
+  is how the index pipeline actually drives Claude Code, which has more sharp
+  edges than it looks like it does.
 - [`docs/measurements/`](docs/measurements/) is what the target machine actually does.
 - [`docs/research/`](docs/research/) is the prior survey, archived unedited.
 - `crates/` carries the RFC's data model as Rust types. `cargo check` passes and

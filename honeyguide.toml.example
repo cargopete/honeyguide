@@ -35,7 +35,21 @@ num_predict_action = 768
 claude_bin   = "claude"
 claude_model = "opus"
 map_tokens   = 1200
+
+# "prompt" by default because a full index run consumes the same Max quota the
+# user is working with, and takes tens of minutes. See RFC-0002 §7.
 auto_refresh = "prompt"   # prompt | always | never
+
+# One persistent `claude -p` process per index run, restarted every N modules to
+# stop the accumulated conversation from making every turn re-read it. Each
+# restart costs ~4s and a ~33k-token preamble, so this trades one cost against
+# the other. 15 is a starting guess, not a measurement (RFC-0002 Q1).
+restart_every = 15
+
+# The semantic pass gets no write capability at all. hg writes every artifact
+# itself. Path patterns in an allow-list gate nothing: measured, a run allowed
+# `Write(out/**)` wrote outside it without complaint. RFC-0002 §4.
+allowed_tools = ["Read", "Grep", "Glob"]
 
 [gate]
 check_cmd    = "cargo check"
