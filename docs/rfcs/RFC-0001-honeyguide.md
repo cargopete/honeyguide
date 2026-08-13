@@ -4,16 +4,34 @@
 |---|---|
 | Status | draft |
 | Author | Pete / Nixum |
-| Revision | 3 (2026-08-12) |
+| Revision | 4 (2026-08-13) |
 | Depends on | `docs/research/2026-08-local-model-tui-coding-agent.md` |
-| Evidence | `docs/measurements/2026-08-12b-clean-rerun.md` |
+| Evidence | `docs/measurements/2026-08-13-m0-suite.md`, `docs/measurements/2026-08-12b-clean-rerun.md` |
 | Target | v0.1 (index + local loop), v0.2 (escalation) |
 
 ## Revision note
 
+**Revision 4 exists because M0 was run in full and the compile gate, as
+specified, was the thing holding the model back.** §6.2 said an edit that fails
+`cargo check` is reverted. That makes every change with no compiling intermediate
+state unreachable — adding a struct field breaks the literals that construct it,
+so there is no single edit from green to green — and the model can never climb
+out, because each turn the harness undoes what it just did. Measured: eight
+edits, every one matching the file uniquely, none fabricated, all eight thrown
+away, and a first-apply rate of 0/8 that reads exactly like a model which cannot
+write Rust.
+
+Edits now accumulate and the harness owns the retreat (§6.2). Five further
+deterministic rules came out of the same suite (§6.3), one of which — refusing an
+`edit` whose `replace` equals its `search` — was correcting the headline metric
+rather than the model's behaviour. §12 accordingly demotes FACP to a diagnostic
+and makes the oracle completion rate the quality number. Q6 is closed, and Q7 is
+new and is now the question the project turns on: **neither model completed a
+single multi-site cascading edit, in twelve attempts.**
+
 Revision 1 assumed Qwen3-Coder-30B-A3B on a local Ryzen box with llama-server
 and GBNF. Revision 2 replaced that with measurements of the real target.
-**Revision 3 exists because most of revision 2's measurements were wrong.**
+**Revision 3 existed because most of revision 2's measurements were wrong.**
 
 The morning's probes ran unwarmed, minutes apart, under Ollama's default
 five-minute `keep_alive`, so the model was unloading between them and reload
@@ -301,15 +319,23 @@ removed is a failure mode removed; revisit only with eval evidence.
 
 Edits never touch the working tree directly.
 
-1. At session start, build an overlay of the project (Q2).
-2. `edit` applies to the overlay, then `cargo check --message-format json` runs
-   workspace-scoped.
-3. On pass, emit `EditProposed` with a diff. The TUI offers approve or reject;
-   auto-approve is configurable. On approval, replay onto the working tree with a
-   fresh unique-match check against the real file, which guards against an
-   external edit landing in between.
-4. On failure, emit `EditBounced`, feed the rustc errors back verbatim as the
-   observation, and increment the repair count.
+1. At session start, copy the working tree to an overlay (`cp -Rc`, falling back
+   to `cp -R`), sharing one `--target-dir` with the working tree. Q2, closed:
+   0.03s to build, 0.29s per gate once warm, and no fingerprint thrashing.
+2. `edit` applies to the overlay, then `cargo check --workspace --all-targets
+   --message-format json` runs.
+3. **On red, the edit stays.** Emit `EditBounced`, feed the rustc errors back
+   verbatim as the observation, and increment the repair count. The overlay is
+   now red and the harness knows it.
+4. **After three red gates without the error count falling, the harness rolls
+   the overlay back** to the last state that compiled and says so. The trigger is
+   lack of progress, not elapsed redness. The bookkeeping is the harness's, not
+   the model's.
+5. On green, emit `EditProposed` with the diff against the working tree. The TUI
+   offers approve or reject; auto-approve is configurable. On approval, replay
+   onto the working tree with a fresh unique-match check against the real file,
+   which guards against an external edit landing in between.
+6. `finish` is refused while the overlay is red (§6.3).
 
 Measured against the M0 target: a real change in `dipper`'s core crate
 cascades to all four dependent crates and `cargo check --workspace` completes in
@@ -319,6 +345,71 @@ A six-turn model loop on the same task takes about fifty seconds.
 The gate is therefore both the primary quality mechanism and, by roughly two
 orders of magnitude, the cheapest thing in the loop. Everything else is context
 plumbing.
+
+**Revision 4, and it is a correction rather than a refinement.** Rule 3 used to
+read "on failure, revert the edit". M0 showed that this makes a whole class of
+correct changes unreachable, and the class is not an exotic one: it is every
+change with no compiling intermediate state.
+
+The control model was asked to add a field to `Record` and fix the literals that
+break. Adding the field is what breaks them, so there is no single edit that
+takes the file from green to green. It proposed eight edits. All eight matched
+the file uniquely, so not one of them was fabricated. All eight were reverted.
+Twelve turns, four minutes, and the file ended exactly as it started. The model
+wrote a correct first edit on turn one and the harness threw it away, then threw
+away its next seven attempts to repair the consequences.
+
+A gate that reverts on red does not accept correct changes. It accepts
+*individually compilable* changes, which is a strictly smaller set, and it is a
+ratchet the model cannot climb because every rung is red by construction. Worse,
+the failure is invisible in the metric: FACP reads 0/8 and looks exactly like a
+model that cannot write Rust.
+
+So the gate keeps the edit and reports the errors, which was always the useful
+half, and the harness owns the retreat. The model is never asked to remember how
+to undo anything, which is the same principle as §6.3's provision rule. A red
+overlay is a state the harness tracks, not a mistake it punishes.
+
+**What the retreat triggers on took two attempts.** The rule was first written as
+three consecutive red gates, and that is wrong for the same reason revert-on-red
+was wrong: a cascading change is red on every intermediate turn by construction.
+The rename task needs four edits (the method, `dipper-cli`, and two test callers)
+and is therefore red three times running on its way to green. The rollback fired
+on the turn before success and threw away a correct rename. Measured, not
+reasoned: it happened on the first trial of the first run.
+
+The trigger is instead the rustc error count, taken from the diagnostics the gate
+already has. Falling means progress and resets the counter; three turns without
+it falling means the model is going nowhere and the harness restores the last
+green state. On the rename task the count runs 3, 2, 1, 0 as the callers are
+fixed, so a model doing the work correctly is never interrupted, while one
+flailing is stopped after three turns. The count is also worth handing back:
+"2 errors, down from 3" is a progress signal the model gets for nothing.
+
+`--all-targets` is part of the same correction, and it is worth setting down how
+it was established, because the first version of this paragraph was wrong.
+
+Plain `cargo check` does not typecheck `#[cfg(test)]` code. Measured directly: a
+type error planted inside a `#[cfg(test)]` module in `dipper-index` gives
+`cargo check --workspace` an exit code of **0**, and `--all-targets` an exit code
+of **101**. So the gate as originally specified can pass an edit that the
+`cargo test` oracle then fails, which is the worst ordering available, since the
+harness would report a green gate on a broken crate.
+
+The claim originally offered as evidence was that M0's rename task demonstrated
+this, its callers living in a `mod tests` in the edited file. That was not true.
+The rename was caught by plain `cargo check`, because `dipper-cli` also calls
+`Catalogue::count` and the workspace build sees it. The general point stands and
+is now measured on its own terms; the example did not, and repeating §12.1, a
+behavioural claim is worth exactly as much as the probe that established it.
+
+Cost, three trials each on a warm target directory: **0.11s** with nothing
+changed, **0.31s** after a change to the core crate that compiles and cascades to
+all four dependents. Both are cheaper than the 0.77s recorded earlier for plain
+`cargo check`, which is a difference in what was changed rather than a saving
+from `--all-targets`. And a red gate is cheaper still, because compilation stops
+at the first error: an edit that breaks its own caller comes back in 0.20s.
+Widening the gate to see test code costs nothing worth counting.
 
 ### 6.3 Deterministic preconditions
 
@@ -362,10 +453,59 @@ instead:
 |---|---|---|
 | `edit` on an unread path | refuse, "read it first" | return the file contents, note the edit was not applied, invite a retry |
 | identical action repeated | refuse each time | refuse, and **abort the turn after three**, rather than burning the cap |
+| identical `read` repeated | refuse | **serve the next unseen window** of the file; refuse only once the whole file has been shown |
 | missing required arguments | refuse, naming them | unchanged; nothing to satisfy |
 
 With that change plus §5.3 pre-loading, the same task went from twelve turns and
 no edit to five turns and a clean first-apply pass.
+
+Three further rules came out of the full five-task M0 suite, and each one is a
+failure the harness can settle without asking the model anything.
+
+- **`finish` is a claim, and the harness can check it.** The control model
+  searched, read, searched, read, ran `check`, and declared the task complete
+  having made no edit at all. Every action was well-formed, permitted and
+  non-repeating; nothing above catches it, because nothing about it was wrong
+  except that it was untrue. A `finish` is therefore refused when no edit has
+  been applied in the session, and refused while the overlay is red (§6.2). Both
+  are facts the harness already holds.
+- **A green gate must say what happens next.** Told only "edit applied and
+  `cargo check` passed", both models re-sent the identical edit until the stall
+  rule aborted them. A bare success reads as no signal at all. The observation
+  now says the edit has landed, not to send it again, and to emit `finish` if
+  the task is done.
+- **An edit whose `replace` equals its `search` is not an edit.** This one was
+  corrupting the headline metric rather than merely wasting turns. The model
+  emits the two fields byte-identical; the harness applies the change, and
+  `cargo check` passes because nothing has changed, so FACP records a
+  first-apply pass for an edit that did nothing. Two of the five tasks in one
+  trial "passed the gate" this way and failed their oracles. The model's
+  response was reasonable and the harness's was not: it re-sent the same no-op,
+  because it could see the task was not done while the harness kept insisting
+  the edit had landed. Refused before the gate, at a cost of one string
+  comparison.
+- **The stall check must run before the argument check, not after.** With the
+  order reversed, a malformed action never updated the last-action record, so a
+  model repeating the *same* malformed action was never seen to be repeating.
+  The driver sent an identical argument-less `edit` twelve times and collected
+  twelve separate refusals, one per turn, to the cap. A rule that only runs on
+  well-formed input is not a rule against stalling. Reordered, the same failure
+  costs four turns instead of twelve.
+- **The stall signature must be scoped to the fields the tool uses.** Because
+  the action schema requires every string field on every action (§6.1 and
+  `prompts/README.md`), a `check` carries leftover `search` text that drifts
+  turn to turn, and a signature computed over all fields quietly stops matching.
+  Two consecutive identical `check`s were served before the rule fired. The
+  signature covers `(tool, path, search, replace)` for an `edit`, `(tool,
+  query)` for a `search`, `(tool, path, start, end)` for a `read`, and the tool
+  alone for `check` and `finish`. It is also compared against the **last four**
+  actions rather than only the previous one: refused once, the model alternates
+  between two near-identical malformed forms, and A-B-A-B defeats a detector
+  with a memory of one. Observed over turns 8 to 12 of a rename attempt.
+
+The pattern across all three is the same one §6.2 arrived at independently:
+these are not judgement calls the model has to get right. They are bookkeeping,
+and bookkeeping belongs in the harness.
 
 The generalisation is worth stating because it cuts against the instinct: a
 deterministic guardrail should where possible hand the model what it was missing,
@@ -620,8 +760,22 @@ Two headline metrics, tracked across releases:
 
 - **WFA**, well-formed action rate. Should sit near 100% under schema
   constraint. A drop means a serving bug, not model drift.
-- **FACP**, first-apply `cargo check` pass rate. The real quality number, gated
-  at 60% for M0.
+- **FACP**, first-apply `cargo check` pass rate. Gated at 60% for M0, and less
+  trustworthy than it looks. Two things have to be said about it, both learned
+  from M0 rather than reasoned:
+
+  Its denominator must be **edits proposed**, not edits that happened to match
+  the file. Counting only the ones that matched excuses a model that writes
+  `search` text it never read, which is the first failure this project ever
+  observed.
+
+  And it is **necessary, not sufficient, and by a wide margin.** In one M0 trial
+  four of five tasks had an edit pass the gate and one of five passed its
+  oracle. A compiling change is not a correct change, and a metric derived from
+  the compiler cannot tell the difference. **The oracle rate is the real quality
+  number.** FACP is a diagnostic: when it and the oracle rate diverge, the model
+  is writing plausible Rust that does the wrong thing, and when they move
+  together the harness is doing its job.
 
 A third is worth watching on this hardware: **prefill cache hit rate**, since it
 is the difference between a usable session and an unusable one, and it will
@@ -670,13 +824,37 @@ meaningless anyway.
 
 ## 13. Milestones
 
-- **M0, thesis spike.** A throwaway script, not a product. Three tools, schema
-  constraint, a hand-written index for one crate, five smoke tests. Two gates
-  now, not one: FACP at 60% or better, **and** a median turn under 120 seconds
-  on a realistic multi-turn task. The second gate is the one §8.3 put there, and
-  a tool that is correct but takes four minutes a turn has failed just as
-  surely as one that is fast and wrong. Below either gate, pull the model A/B
-  (Q4) forward before writing any more harness.
+- **M0, thesis spike. RUN. G2 failed, the turn-time gate passed.** A throwaway
+  script, not a product. Three tools, schema constraint, a hand-written index for
+  one crate, five smoke tests. Two gates, not one: FACP at 60% or better, **and**
+  a median turn under 120 seconds on a realistic multi-turn task. The second gate
+  is the one §8.3 put there, and a tool that is correct but takes four minutes a
+  turn has failed just as surely as one that is fast and wrong. Below either
+  gate, pull the model A/B (Q4) forward before writing any more harness.
+
+  **Result**, three suites per model, full record in
+  [`docs/measurements/2026-08-13-m0-suite.md`](../measurements/2026-08-13-m0-suite.md):
+
+  | | driver | control |
+  |---|---|---|
+  | FACP, of edits proposed | 25% | 33% |
+  | Tasks actually completed | 6/15 | 9/15 |
+  | Median turn | 8.7s | 16.6s |
+
+  G2 fails for both models on either denominator. The turn-time gate passes by a
+  factor of fourteen. The A/B that §13 prescribes on a failed gate was run, and
+  its answer is that the model is not the variable: both models scored **0/3 on
+  both cascading tasks** and the difference between them is confined to how
+  reliably they do the single-site ones. So the instruction to reconsider the
+  model is satisfied and does not point at a model change. The binding
+  constraint is Q7, and it is the harness's.
+
+  **A metric proposal, made after seeing the data and flagged as such.** G2
+  should be the oracle completion rate, not FACP. In one trial four of five
+  tasks had an edit pass the compile gate and one of five actually did the job,
+  and no metric derived from the compiler can tell a compiling change from a
+  correct one (§12). This has not been applied retroactively: the verdict above
+  is against the gate as written.
 - **M1, index pipeline.** `hg-index` complete, including degraded mode and
   `--refresh`. The deliverable is `hg index` run against nuthatch producing an
   `.agent-index/` a human would actually read.
@@ -727,10 +905,35 @@ closed is the most useful thing in this document.
 - **Q1: prefix-cache behaviour. CLOSED, yes.** Extensions are served in 1.65 to
   2.96 seconds against ~18 for a fresh prompt of the same size, 3/3. Revision 2
   claimed the opposite at length and was measuring an unwarmed model reloading.
-- **Q2: overlay mechanism.** Still open. A `cp -al` hardlink forest is fragile
-  if any tool writes in place; the likely answer is a per-edited-file copy with
-  a shared `--target-dir`. Cheap to settle now that the gate is known to cost
-  0.77s on the M0 target.
+- **Q2: overlay mechanism. CLOSED.** A whole-tree copy, `cp -Rc` where the
+  filesystem supports copy-on-write and plain `cp -R` otherwise, sharing one
+  `--target-dir` with the working tree. `scripts/overlay-probe.py` measured the
+  four candidates against the M0 target.
+
+  **`cp -al` is disqualified, and behaviourally rather than by argument.** The
+  probe writes into the overlay the way a naive tool writes — open, truncate,
+  write — and then checks the working tree. Under a hardlink forest the working
+  tree changed. That is the silent-corruption failure this design exists to
+  refuse, so it is not a trade-off to be weighed against speed.
+
+  **Build cost is a non-issue and the per-edited-file scheme is unnecessary.**
+  All four mechanisms build in **0.03s**, because a 14.7k-line workspace is 2 MB
+  of source. Copying the lot is simpler than tracking which files have been
+  touched, and simpler wins when the complicated version buys nothing.
+
+  **A shared target directory does not thrash, which was the real question.**
+  Cargo fingerprints record absolute paths, so alternating between two source
+  trees might have invalidated everything on every switch and turned a 0.3s gate
+  into a 13s one. It does not: cargo keys its units by package path and the two
+  trees' artifacts coexist. With the overlay diverged from the working tree and
+  a **fresh** edit each round, alternating checks run **0.29s** in the overlay
+  and **0.12s** in the working tree, repeatedly. The overlay's first check costs
+  0.5 to 1.3s; a cold target directory of its own would have cost **13.2s**.
+
+  A `git worktree` also passes the aliasing check and gives a free diff, and is
+  rejected for a reason that has nothing to do with performance: it materialises
+  `HEAD`, not the working tree, so a session started with uncommitted changes
+  would silently work against different code from the one the user is looking at.
 - **Q3: does the repo map help or hurt?** Still open, but now a question about
   comprehension rather than seconds: 1,200 tokens costs about 3 seconds, once.
   Aider's warning that weak models are confused by large maps is the live
@@ -750,7 +953,35 @@ closed is the most useful thing in this document.
   end-to-end six-turn number favours the hybrid, and the rule of thumb this once
   proposed ("prefer pure attention, grep the GGUF for `ssm.`") should be
   disregarded. It was a good rule about a fact that was not true.
-- **Q6: does the §6.3 stall rule close the quality gap?** New, and the one that
-  matters. The driver's failure is repetition rather than fabrication, so a
-  deterministic refusal ought to convert a wasted turn into a corrected one.
-  Untested. M0 answers it.
+- **Q6: does the §6.3 stall rule close the quality gap? CLOSED, no, and the
+  question was aimed at the wrong gap.** Measured over three full suites per
+  model. The rule fires constantly and does its narrower job: 29 stall refusals
+  for the driver, and `fix_test` went from four turns to two once a green gate
+  said what to do next. What it does *not* do is convert a wasted turn into a
+  corrected one. Twelve of the driver's fifteen tasks still ended in a stall
+  abort. The rule bounds the cost of stalling; it does not turn stalling into
+  progress, and the driver still finished 6/15 against the control's 9/15.
+
+  The premise was also wrong in a way worth recording. The gap the rule was
+  meant to close is not where the failures are. Every failure in the suite, for
+  **both** models, was one of the two tasks needing edits in more than one
+  place: 0/3 and 0/3 each. On single-site tasks the driver runs 2/3 and the
+  control 3/3. So the driver's deficit there is variance rather than
+  competence, which §6.3 does attack, and the headline failure is Q7's, which
+  no §6.3 rule touches.
+- **Q7: can a five-tool loop complete a cascading multi-site edit at all?** New,
+  and now the one that matters. Zero completions in twelve attempts across two
+  models, on `rename` (a method plus its callers in two other files) and
+  `add_field` (a field plus the literals it breaks). The revised gate makes such
+  a change *reachable* — the error count visibly falls, 3 to 2 to 1 — but
+  neither model closes it inside twelve turns.
+
+  Three candidate answers, in increasing order of how much they concede. Raise
+  the turn cap, which is cheap and may simply be the answer, since one trial
+  reached the cap with one error left. Have the harness present one rustc error
+  at a time as a sub-task, with its file, line and surrounding lines, which is
+  §6.3's provision principle applied to repair. Or have the harness perform
+  mechanical multi-site refactors itself out of `scip.sqlite`, which already
+  holds every reference, and leave the model the single semantic decision. The
+  third is the thesis of this document taken to its conclusion, and it should be
+  reached last and on evidence, not first and on enthusiasm.

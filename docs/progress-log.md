@@ -2,6 +2,90 @@
 
 Newest first. One entry per meaningful slice of work.
 
+## 2026-08-13 - M0 run in full. The gate was the thing holding the model back
+
+The five-task suite against a real `dipper` checkout, three trials per model,
+both gates measured for the first time. Full record in
+[`docs/measurements/2026-08-13-m0-suite.md`](measurements/2026-08-13-m0-suite.md).
+
+**The result that matters is not the score.** Neither model completed a single
+cascading multi-site task: `rename` and `add_field` went 0/3 for the driver and
+0/3 for the control. Every other failure in the suite is one of those two tasks.
+The single-site tasks run at 2/3 for the driver and 3/3 for the control. The
+failure is a cliff, not a slope, and it is the harness's, not a model's. That is
+now Q7.
+
+| | driver | control |
+|---|---|---|
+| WFA | 90/90 | 98/98 |
+| FACP, of edits proposed | 25% | 33% |
+| **Tasks actually completed** | **6/15** | **9/15** |
+| per trial | 3, 1, 2 | 3, 3, 3 |
+| median turn | **8.7s** | 16.6s |
+| total wall | 949s | 1,896s |
+
+**G2 (FACP 60%) fails for both. The turn-time gate passes by 14x.** §13 says a
+failed gate means pulling the model A/B forward; it was run and the answer is
+that the model is not the variable. The control is 1.5x the completions for
+exactly 2x the wall-clock, and its advantage is entirely consistency on tasks
+the driver can already do: 3/3/3 against 3/1/2 on identical inputs.
+
+**Seven harness defects, found by running it**, five of them making the model
+look worse than it was. The two that matter:
+
+*The gate was a ratchet.* §6.2 reverted any edit that failed `cargo check`, which
+makes every change with no compiling intermediate state unreachable. The control
+proposed eight edits on `add_field`, every one matching the file uniquely, none
+fabricated, and all eight were thrown away — because adding a field is what
+breaks the literals that construct it. Twelve turns, four minutes, file
+unchanged, FACP recording 0/8. Edits now accumulate, errors come back, and the
+harness rolls back to the last green state itself when the rustc error count
+stops falling. The first version of that rollback counted red turns instead and
+fired one turn before success, throwing away a correct rename.
+
+*FACP was counting no-ops.* The model emits edits whose `replace` is
+byte-identical to `search`. The harness applied them, `cargo check` passed
+because nothing had changed, and it scored a first-apply pass. Two of five tasks
+in one trial "passed the gate" this way and failed their oracles. Every FACP
+figure taken before the fix is inflated by an unknown amount, which is why §12
+now says the oracle rate is the real quality number and FACP is a diagnostic.
+
+**Four of the five tasks had no oracle at all** before today; the fallback was
+"does the workspace still compile", which is true of a workspace nobody has
+touched. The control's first `rename` run — search, read, `check`, declare
+victory, zero edits — would have scored a pass. `--selftest` now asserts every
+oracle fails on a pristine tree.
+
+Also measured: plain `cargo check` returns **0** on a type error inside a
+`#[cfg(test)]` module where `--all-targets` returns **101**, so the gate now uses
+the latter, at a cost of nothing worth counting (0.11s idle, 0.31s on a cascading
+change). The first example offered for that claim was wrong and is recorded as
+withdrawn in §6.2, which is becoming a tradition.
+
+**The project brief looked decisive and then did not.** M1's first question is
+whether the index earns its place. Unpaired, the driver scored 4/10 with the
+brief and 0/10 without, and the mechanism looked convincing: with no brief it
+paged through the entire file across four turns, exhausted it, and stalled
+without ever proposing an edit. That run then died on a socket timeout against a
+host which afterwards held no model, so the arms were re-run back to back. Paired,
+**2/5 and 2/5**, with the no-brief arm editing normally. The unpaired figures were
+measuring the ThinkPad. Unresolved rather than null — five tasks an arm decides
+nothing — but it means M1's semantic pass has no evidence behind it yet, and
+RFC-0003 §3 needs only the structural half.
+
+**Q2 closed the same day**, with `scripts/overlay-probe.py`. The overlay is a
+whole-tree `cp -Rc` (plain `cp -R` fallback) sharing one `--target-dir` with the
+working tree. The hardlink forest was disqualified behaviourally rather than by
+argument: written to the way a naive tool writes, it changed the file in the real
+working tree. Build cost is 0.03s for every candidate, because 14.7k lines is
+2 MB, so the per-edited-file scheme revision 3 guessed at is unnecessary. And the
+shared target directory does **not** thrash, which was the actual risk: with the
+overlay diverged and a fresh edit each round, alternating gates run 0.29s in the
+overlay and 0.12s in the working tree, indefinitely. Its own target directory
+would have cost a 13.2s cold build at session start. `git worktree` passes every
+test and is rejected anyway, because it materialises `HEAD` rather than the
+working tree.
+
 ## 2026-08-12 (evening) - most of today's measurements were wrong
 
 RFC-0001 revision 3. The morning's throughput and prefix-cache figures did not

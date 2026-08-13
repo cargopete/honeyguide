@@ -13,12 +13,18 @@ Named for the honeyguide bird, which cannot open the hive itself and so leads a
 stronger partner to it. Here the roles are inverted: the strong partner charts
 the territory, and the small bird works it.
 
-## Status: design only. There is no working agent.
+## Status: design, plus a spike that runs. There is no working agent.
 
-Nothing here runs yet. What exists is a specification, the data model as Rust
-types that compile and do nothing, and a set of measurements against a real
-local model. It is public because the measurements are the useful part and
-nobody else seems to have published them.
+The Rust crates are the data model and nothing else; `cargo check` passes and
+that is the entire claim. What does run is `m0/spike.py`, a throwaway harness
+that implements the parts of the design the thesis depends on and has now been
+run end to end against a real 14.7k-line workspace, three trials per model.
+
+Its verdict on itself: the quality gate is **failed** and the turn-time gate is
+passed by a factor of fourteen. The suite's value was never the score, though. It
+found seven defects in the harness, five of which were making the model look
+worse than it is, and one of which meant the gate was quietly refusing a whole
+class of correct edits. Those are below.
 
 | | |
 |---|---|
@@ -65,6 +71,33 @@ Measured against `heretic:latest` (`Qwen3.6-35B-A3B-uncensored-heretic`, Q4_K_M)
 on Ollama, with `qwen3-coder:30b` as a same-quant, same-active-size,
 pure-attention control. Full method in
 [`docs/measurements/`](docs/measurements/2026-08-12b-clean-rerun.md).
+
+**A compile gate that reverts failed edits cannot accept a whole class of correct
+changes.** This is the one to steal, and it took running the suite to see it.
+Reverting on red sounds obviously right and quietly restricts the model to
+*individually compilable* edits, which is a much smaller set than correct ones.
+Ask it to add a field to a struct and fix the literals that break: adding the
+field is what breaks them, so there is no single edit from green to green. The
+control model proposed eight edits, every one matching the file exactly, none
+fabricated, and the harness threw all eight away. Twelve turns, four minutes,
+file unchanged, and a first-apply pass rate of 0/8 that looks exactly like a
+model which cannot write Rust. It had written a correct edit on turn one. Edits
+must accumulate; the harness rolls back when the rustc error count stops falling,
+which is a measure of progress rather than of elapsed failure.
+
+**Neither model completed a single multi-site edit, in twelve attempts.** Rename
+a method with callers in two other files, or add that struct field: 0/3 for the
+driver and 0/3 for the control. Every other task in the suite ran at 2/3 and 3/3.
+The failure is a cliff and it is the harness's, not the model's, which is worth
+knowing before anyone spends a month choosing a better model.
+
+**Watch what your success metric counts.** The model emits edits whose `replace`
+is byte-identical to its `search`. The harness applied them, `cargo check` passed
+because nothing had changed, and the metric recorded a pass. Two of five tasks in
+one trial "passed the gate" that way. Separately, four of the five smoke tasks
+had no real oracle, falling back to "does the workspace still compile" — which is
+true of a workspace nobody has touched, and would have scored a pass for a run
+that made no edit at all and said it was done.
 
 **Decode is the binding cost, not prefill.** 359 tok/s prefill against 25.3
 tok/s decode, so one generated token costs about fourteen prompt tokens. Context
