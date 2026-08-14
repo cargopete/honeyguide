@@ -30,6 +30,7 @@ import collections
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -45,7 +46,9 @@ REPO_ROOT = HERE.parent
 SYSTEM = (REPO_ROOT / "prompts" / "system.md").read_text()
 SCHEMA = json.loads((REPO_ROOT / "prompts" / "action-schema.json").read_text())
 
-MAX_TURNS = 12
+MAX_TURNS = 12          # RFC-0003 §6: overridable, because one M0 `rename` trial
+                        # hit this cap with the error count still falling. That is a
+                        # stopwatch, not a model failure, and it needs measuring.
 MAX_EDIT_LINES = 200
 OBS_CAP = 4000          # characters; observations are truncated hard (§8.5)
 GUTTER = re.compile(r"^\s*\d+\|", re.M)
@@ -106,12 +109,121 @@ def call(messages, schema=None, num_predict=600):
         return _post(payload)
 
 
+# ------------------------------------------- mechanical propagation (RFC-0003 §3)
+
+TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+DEFINES = r"\b(fn|struct|enum|trait|type|mod|const|static|union)\s+{}\b"
+
+
+def detect_rename(search, replace):
+    """Is this edit a pure rename of one identifier? Returns (old, new) or None.
+
+    Conservative by design: a false negative costs nothing and a false positive
+    edits code nobody asked to change. It requires the two texts to be identical
+    except for exactly one identifier token, differing in exactly one position.
+    """
+    a, b = TOKEN.findall(search), TOKEN.findall(replace)
+    if len(a) != len(b) or TOKEN.sub("\0", search) != TOKEN.sub("\0", replace):
+        return None                                  # skeleton differs: not a rename
+    # Distinct substitutions, not differing positions: renaming a function and
+    # its own recursive call inside one block is still a single rename.
+    diff = {(x, y) for x, y in zip(a, b) if x != y}
+    if len(diff) != 1:
+        return None
+    old, new = diff.pop()
+    # every occurrence of the old token must have become the new one, or this is
+    # a rename of one use rather than of the symbol
+    if any(x == old and y != new for x, y in zip(a, b)):
+        return None
+    return (old, new) if old and new and old != new else None
+
+
+def _mask(line):
+    """Blank out string literals and trailing comments, so propagation never
+    rewrites prose or a user-visible message. Crude, and deliberately so: the
+    cost of a miss is a skipped site the model can still fix by hand, and the
+    cost of a false hit is silently changing a string the compiler cannot check."""
+    out = list(line)
+    i, in_str = 0, False
+    while i < len(line):
+        c = line[i]
+        if in_str:
+            out[i] = " "
+            if c == "\\":
+                if i + 1 < len(line):
+                    out[i + 1] = " "
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+            out[i] = " "
+        elif c == "/" and i + 1 < len(line) and line[i + 1] == "/":
+            for j in range(i, len(line)):
+                out[j] = " "
+            break
+        i += 1
+    return "".join(out)
+
+
+def propagate_rename(repo: Path, old: str, new: str, skip: Path, snapshot=None):
+    """Apply `old` -> `new` at every whole-token reference outside `skip`.
+
+    **This is unsafe on a lexical reference set and is off by default.** Tried on
+    dipper, renaming `Catalogue::count` rewrote 84 sites across 15 files:
+    `Iterator::count()`, struct fields named `count`, local bindings named
+    `count`. None of them referenced the renamed method. A whole-token grep
+    cannot tell a method on one type from an identical name on another, so this
+    is fuzzy application by another name, and RFC-0001 §7 forbids it for exactly
+    this outcome.
+
+    Kept because the mechanism around it is right and only the reference set is
+    wrong: `scip.sqlite` answers "every reference to *this* symbol" exactly, and
+    at that point this function becomes correct without changing. Until then it
+    requires `--propagate` and should only be pointed at a repository you are
+    willing to lose.
+    """
+    if shutil.which("rg"):
+        cmd = ["rg", "-l", "-w", "-F", old, "--glob", "*.rs", "."]
+    else:
+        cmd = ["grep", "-rlwF", "--include=*.rs", old, "."]
+    p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True)
+
+    changed, skipped = [], []
+    for rel in (p.stdout or "").split():
+        rel = rel.lstrip("./")
+        f = (repo / rel).resolve()
+        if not f.is_file() or f == skip.resolve():
+            continue
+        orig = f.read_text(errors="replace")
+        lines, n = orig.splitlines(keepends=True), 0
+        for i, line in enumerate(lines):
+            masked = _mask(line)
+            hits = [m for m in TOKEN.finditer(masked) if m.group(0) == old]
+            if not hits:
+                continue
+            buf = list(line)
+            for m in reversed(hits):
+                buf[m.start():m.end()] = new
+            lines[i] = "".join(buf)
+            n += len(hits)
+        if n:
+            if snapshot:
+                snapshot(f, orig)      # so §6.2's rollback can restore these too
+            f.write_text("".join(lines))
+            changed.append((rel, n))
+        else:
+            skipped.append(rel)                      # matched only in strings/comments
+    return changed, skipped
+
+
 # ---------------------------------------------------------------------- tools
 
 class Session:
     """One task attempt against one overlay."""
 
-    def __init__(self, repo: Path, target_dir: Path, check_cmd):
+    def __init__(self, repo: Path, target_dir: Path, check_cmd, propagate=False):
         self.repo = repo
         self.env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir))
         self.check_cmd = check_cmd
@@ -137,6 +249,8 @@ class Session:
         self.no_progress = 0
         self.best_errors = None
         self.reverts = 0
+        self.propagate = propagate      # RFC-0003 §3
+        self.propagated = 0
 
     # -- helpers
 
@@ -181,7 +295,6 @@ class Session:
         # Stands in for scip.sqlite until hg-index exists. Structural enough for
         # a spike: symbol-ish grep, capped at 20 hits. Falls back to grep because
         # ripgrep is not always a real binary on the PATH.
-        import shutil
         if shutil.which("rg"):
             cmd = ["rg", "-n", "--no-heading", "-m", "20", query, "crates"]
         else:
@@ -250,6 +363,27 @@ class Session:
         self.edits_applied += 1
         self.green.setdefault(str(p), text)     # session starts green
         p.write_text(text.replace(search, replace, 1))
+
+        # RFC-0003 §3. If this edit renamed a definition, the remaining work is
+        # the identical substitution at sites the harness already knows. Neither
+        # model completed such a task in twelve attempts; the harness does it in
+        # milliseconds. Propagation happens before the gate so the whole batch is
+        # judged as one change.
+        note = ""
+        if self.propagate:
+            ren = detect_rename(search, replace)
+            if ren and re.search(DEFINES.format(re.escape(ren[0])), search):
+                changed, skipped = propagate_rename(
+                    self.repo, ren[0], ren[1], p,
+                    snapshot=lambda q, t: self.green.setdefault(str(q), t))
+                if changed:
+                    self.propagated += sum(n for _, n in changed)
+                    where = ", ".join(f"{r} ({n})" for r, n in changed)
+                    note = (f"\nThe harness also renamed `{ren[0]}` to `{ren[1]}` at "
+                            f"{sum(n for _, n in changed)} reference site(s): {where}.")
+                    if skipped:
+                        note += (" Skipped, matched only inside strings or comments: "
+                                 + ", ".join(skipped) + ".")
         ok, diag, secs = self.run_check()
         self.gate_green = ok
         if ok:
@@ -260,7 +394,7 @@ class Session:
                 self.green[q] = Path(q).read_text()
             # M0 finding: a bare success reads as no signal at all. Both models
             # re-sent an edit that had already landed. Say what happens next.
-            return (f"edit applied to {path} and `cargo check` passed in {secs:.1f}s. "
+            return (f"edit applied to {path} and `cargo check` passed in {secs:.1f}s.{note} "
                     "Do not send this edit again. If the task is now complete, emit "
                     "`finish` with a one-line summary; otherwise make the next edit.")
 
@@ -288,8 +422,8 @@ class Session:
                     f"the last state that compiled. Start again from there.\n{diag[-2000:]}")
 
         trend = f"{n} error(s), down from {was}" if was and n < was else f"{n} error(s)"
-        return (f"edit applied to {path}, but `cargo check` now FAILS with {trend}. The edit "
-                "was KEPT. Fix these errors with your next edit; if they are the expected "
+        return (f"edit applied to {path}, but `cargo check` now FAILS with {trend}.{note} The "
+                "edit was KEPT. Fix these errors with your next edit; if they are the expected "
                 "consequence of the change you just made, repair them one at a time.\n"
                 + diag[-2500:])
 
@@ -383,9 +517,14 @@ class Session:
 
 # ------------------------------------------------------------------ the loop
 
-def run_task(task, repo, target_dir, phases, brief, verbose=True, transcript=None):
-    subprocess.run(["git", "checkout", "--", "."], cwd=repo, capture_output=True)
-    subprocess.run(["git", "clean", "-fdq"], cwd=repo, capture_output=True)
+def run_task(task, repo, target_dir, phases, brief, verbose=True, transcript=None,
+             max_turns=MAX_TURNS, reset=True, propagate=False):
+    # `reset` is False for free-form runs. The suite resets because its fixtures
+    # depend on a known starting state; doing that to a repository someone is
+    # actually working in would delete their uncommitted work.
+    if reset:
+        subprocess.run(["git", "checkout", "--", "."], cwd=repo, capture_output=True)
+        subprocess.run(["git", "clean", "-fdq"], cwd=repo, capture_output=True)
     if task.get("setup"):
         task["setup"](repo)
 
@@ -396,7 +535,8 @@ def run_task(task, repo, target_dir, phases, brief, verbose=True, transcript=Non
     # oracle. §6.2 says the gate is the mechanism the design leans on; it has to
     # see the whole crate.
     s = s0 = Session(repo, target_dir,
-                     task.get("check_cmd", "cargo check --workspace --all-targets"))
+                     task.get("check_cmd", "cargo check --workspace --all-targets"),
+                     propagate=propagate)
     # §5.3: retrieval pre-loads the bodies in the blast radius so the model does
     # not have to spend turns fetching what the harness already knows it needs.
     preload = ""
@@ -407,6 +547,13 @@ def run_task(task, repo, target_dir, phases, brief, verbose=True, transcript=Non
             s0.read_paths.add(str(f.resolve()))
             preload += (f"\n\n{rel} ({len(lines)} lines):\n"
                         + "\n".join(f"{i:>4}| {l}" for i, l in enumerate(lines, 1)))
+    if task.get("preload_text"):
+        # free-form mode assembles its own context (§5.3) and marks the paths it
+        # supplied as read, so the read-before-edit precondition is satisfied by
+        # provision rather than costing a turn.
+        preload += task["preload_text"]
+        for rel in task.get("preload_paths", []):
+            s0.read_paths.add(str((repo / rel).resolve()))
 
     msgs = [{"role": "system", "content": SYSTEM + "\n\n" + brief},
             {"role": "user", "content": "Task: " + task["prompt"] + preload}]
@@ -426,7 +573,7 @@ def run_task(task, repo, target_dir, phases, brief, verbose=True, transcript=Non
     t0 = time.time()
     turns = 0
     turn_s = []          # §13's second gate is a *median turn*, so time each one
-    for turns in range(1, MAX_TURNS + 1):
+    for turns in range(1, max_turns + 1):
         t_turn = time.time()
         try:
             if phases == 2:
@@ -489,9 +636,287 @@ def run_task(task, repo, target_dir, phases, brief, verbose=True, transcript=Non
         "wfa": (wfa_ok, wfa_total),
         "edit_actions": s.edit_actions, "edits_applied": s.edits_applied,
         "edits_ok_first_apply": s.edits_first_apply_ok, "reverts": s.reverts,
+        "propagated_sites": s.propagated,
         "final_check_ok": ok, "oracle_ok": oracle_ok,
         "refusals": s.refusals,
     }
+
+
+# --------------------------------------------------- free-form mode (RFC-0003 §7)
+#
+# Everything above this line serves the fixture suite. This section is what makes
+# the spike drivable against a real repository with a real request, which is the
+# only way to find out whether the loop is usable rather than merely measurable.
+#
+# It stands in for two things the Rust crates will own: §5.1's degraded index
+# (G4, no model involved) and §5.3's retrieval. Both are deliberately structural
+# and lexical. Nothing here asks a model anything.
+
+def degraded_brief(repo: Path) -> str:
+    """§5.1 pass 3. With no semantic pass available, build the project brief from
+    `Cargo.toml` metadata and the crate list. This is what `hg index --no-llm`
+    produces, and M0 measured no reliable difference between a hand-written brief
+    and none at all, so it is not obviously worse than the expensive version."""
+    import tomllib
+    root = repo / "Cargo.toml"
+    if not root.is_file():
+        return ""
+    try:
+        cfg = tomllib.loads(root.read_text())
+    except Exception:
+        return ""
+
+    members = cfg.get("workspace", {}).get("members", [])
+    rows = []
+    for pat in members:
+        for d in sorted(repo.glob(pat)):
+            man = d / "Cargo.toml"
+            if not man.is_file():
+                continue
+            try:
+                m = tomllib.loads(man.read_text()).get("package", {})
+            except Exception:
+                continue
+            name = m.get("name", d.name)
+            desc = m.get("description", "")
+            src = d / "src"
+            n = sum(len(f.read_text(errors="replace").splitlines())
+                    for f in src.rglob("*.rs")) if src.is_dir() else 0
+            rows.append(f"| `{name}` | {n} lines | {desc} |")
+
+    pkg = cfg.get("package", {}) or cfg.get("workspace", {}).get("package", {})
+    out = [f"# Project brief: {repo.name}", ""]
+    if pkg.get("description"):
+        out += [pkg["description"], ""]
+    out += ["Generated structurally from Cargo.toml. No semantic pass has run,",
+            "so this describes the shape of the workspace and nothing about intent.",
+            "", "Build and test:", "", "```", "cargo check --workspace --all-targets",
+            "cargo test -p <crate>", "```", ""]
+    if rows:
+        out += ["| Crate | Size | Description |", "|---|---|---|"] + rows + [""]
+    return "\n".join(out)
+
+
+# Identifiers worth searching for: anything backticked, any CamelCase word, and
+# any snake_case word of four characters or more. The length floor keeps "the",
+# "add" and "fix" out of the search, which otherwise match the entire repository.
+IDENT = re.compile(r"`([^`]+)`|\b([A-Z][A-Za-z0-9_]{2,}|[a-z_][a-z0-9_]{2,})\b")
+STOPWORDS = {"the", "and", "that", "this", "with", "from", "into", "make", "have",
+             "then", "when", "where", "which", "should", "would", "there", "their",
+             "every", "also", "does", "your", "file", "line", "code", "test",
+             "tests", "function", "method", "struct", "field", "public", "return",
+             "rename", "update", "change", "caller", "callers", "crates", "src"}
+
+
+def _idents(text):
+    out = []
+    for m in IDENT.finditer(text):
+        tok = (m.group(1) or m.group(2) or "").strip()
+        tok = re.sub(r"^[^A-Za-z_]+|[^A-Za-z0-9_]+$", "", tok)
+        if tok and tok.lower() not in STOPWORDS and not tok.endswith(".rs"):
+            out.append(tok)
+    # paths mentioned literally are the strongest signal of all
+    out += re.findall(r"[\w./-]+\.rs", text)
+    return list(dict.fromkeys(out))
+
+
+def retrieve(repo: Path, task_text: str, max_files=2, max_lines=500, verbose=True):
+    """§5.3 retrieval, structural only. Score files by how many distinct
+    identifiers from the request they contain, take the best few, and supply
+    them. Big files are supplied as the regions around the matches rather than
+    whole, because §8.5 pays for every context token on every subsequent turn."""
+    idents = _idents(task_text)
+    if not idents:
+        return "", [], []
+
+    def rg(pattern, fixed):
+        base = ["rg", "-n", "--no-heading", "--glob", "*.rs"] if shutil.which("rg") \
+            else ["grep", "-rnE", "--include=*.rs"]
+        if shutil.which("rg"):
+            cmd = base + (["-w", "-F"] if fixed else []) + [pattern, "."]
+        else:
+            cmd = (["grep", "-rnwF", "--include=*.rs", pattern, "."] if fixed
+                   else ["grep", "-rnE", "--include=*.rs", pattern, "."])
+        p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True)
+        out = collections.defaultdict(set)
+        for line in (p.stdout or "").splitlines()[:800]:
+            parts = line.split(":", 2)
+            rel = parts[0].lstrip("./")
+            if len(parts) < 3 or not rel.endswith(".rs"):
+                continue
+            try:
+                out[rel].add(int(parts[1]))
+            except ValueError:
+                pass
+        return out
+
+    # The discriminating question is not "does this word appear" but "is this a
+    # symbol". `Add` at the start of a sentence is not a Rust type, and scoring it
+    # as one is how a request about `Record` in `dipper-index` returned a
+    # BitTorrent discovery module. So each candidate is first tested for a
+    # *definition* anywhere in the tree. This is the lexical stand-in for §5.3's
+    # "match against `symbols.sig`", and `scip.sqlite` replaces it at M1.
+    DEF = r"\b(fn|struct|enum|trait|type|mod|const|static|impl|macro_rules!)\s+{}\b"
+    refs, defs, symbols = {}, {}, []
+    for tok in idents[:12]:
+        if tok.endswith(".rs"):
+            hits = rg(tok, True)
+            if hits:
+                refs[tok], defs[tok], symbols = hits, hits, symbols + [tok]
+            continue
+        d = rg(DEF.format(re.escape(tok)), False)
+        if not d:
+            continue                         # not a symbol in this repo: English
+        symbols.append(tok)
+        defs[tok] = d
+        refs[tok] = rg(tok, True)
+
+    if not symbols:
+        return "", [], idents
+
+    # Ubiquity is relative to the repository, not to our own matches. Computed the
+    # other way, `picker` in 6 files looked ubiquitous because our matches only
+    # touched 8, and the request about the piece picker retrieved nothing at all.
+    repo_files = max(1, sum(1 for _ in repo.rglob("*.rs")))
+    score = collections.defaultdict(float)
+    lines_of = collections.defaultdict(set)
+
+    # People name modules and crates after what they do, so a request mentioning
+    # "the magnet link parser" is pointing at `magnet.rs` whether or not `magnet`
+    # happens to be a symbol elsewhere. Without this, a coincidental definition
+    # (`fn parser` in another crate) outranked the module actually named.
+    for tok in idents[:12]:
+        low = tok.lower()
+        for f in repo.rglob("*.rs"):
+            rel = str(f.relative_to(repo))
+            if f.stem.lower() == low:
+                score[rel] += 6.0
+            elif low in rel.lower().split("/")[:-1]:
+                score[rel] += 0.5            # somewhere under a directory of that name
+            elif any(low in part.lower().split("-") for part in rel.split("/")[:2]):
+                score[rel] += 0.4            # crate name, e.g. "cli" in dipper-cli
+    for tok in symbols:
+        # The definition bonus is unconditional. Even a common symbol's *defining*
+        # file is the right place to look, and gating it behind the ubiquity test
+        # threw away the best signal available.
+        for rel, ln in defs[tok].items():
+            score[rel] += 5.0
+            lines_of[rel] |= ln
+        where = refs[tok]
+        if len(where) > max(6, repo_files * 0.25):
+            continue                         # genuinely everywhere: discriminates nothing
+        weight = 1.0 / len(where)
+        for rel, ln in where.items():
+            score[rel] += weight
+            lines_of[rel] |= ln
+
+    if not score:
+        return "", [], idents
+    ranked = sorted(score, key=lambda r: (-score[r], len(r)))[:max_files]
+    if verbose:
+        print(f"retrieval: symbols {symbols} -> "
+              + ", ".join(f"{r} {score[r]:.1f}" for r in ranked))
+    body, used, budget = "", [], max_lines
+    for rel in ranked:
+        f = repo / rel
+        if not f.is_file():
+            continue
+        lines = f.read_text(errors="replace").splitlines()
+        used.append(rel)
+        if len(lines) <= budget:
+            body += (f"\n\n{rel} ({len(lines)} lines, complete):\n"
+                     + "\n".join(f"{i:>4}| {l}" for i, l in enumerate(lines, 1)))
+            budget -= len(lines)
+            continue
+        # too big: give the neighbourhoods of the matches, merged
+        spans, ctx = [], 40
+        for n in sorted(lines_of[rel]):
+            lo, hi = max(1, n - ctx), min(len(lines), n + ctx)
+            if spans and lo <= spans[-1][1] + 1:
+                spans[-1] = (spans[-1][0], max(spans[-1][1], hi))
+            else:
+                spans.append((lo, hi))
+        body += f"\n\n{rel} ({len(lines)} lines, showing the parts that matched):"
+        for lo, hi in spans:
+            if budget <= 0:
+                body += "\n  ... truncated, use `read` for the rest"
+                break
+            hi = min(hi, lo + budget - 1)
+            budget -= hi - lo + 1
+            body += ("\n" + "\n".join(f"{i:>4}| {lines[i-1]}" for i in range(lo, hi + 1))
+                     + "\n  ...")
+    if verbose:
+        print(f"retrieval: {len(idents)} identifiers -> {', '.join(used) or 'nothing'}"
+              f"  ({max_lines - budget} lines supplied)")
+    return body, used, idents
+
+
+def make_overlay(repo: Path, dest: Path):
+    """Q2, closed: a whole-tree copy-on-write clone where the filesystem supports
+    it, a plain copy where it does not. Never a hardlink forest: measured, it
+    writes through to the working tree."""
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True)
+    for flags in ("-Rc", "-R"):
+        p = subprocess.run(f"cp {flags} {repo}/. {dest}", shell=True,
+                           capture_output=True, text=True)
+        if p.returncode == 0:
+            return flags
+    raise RuntimeError(f"could not build an overlay at {dest}")
+
+
+def free_form(a, repo: Path):
+    """`--prompt "..."`: one ad-hoc task against a real repository, worked in an
+    overlay, handed back as a patch. The working tree is never touched."""
+    work = Path(a.work).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    overlay = work / "overlay"
+    flags = make_overlay(repo, overlay)
+    print(f"overlay: cp {flags} -> {overlay}")
+
+    brief = "" if a.no_brief else (Path(a.brief).read_text()
+                                   if a.brief and Path(a.brief).is_file()
+                                   else degraded_brief(overlay))
+    preload, used, idents = retrieve(overlay, a.prompt)
+    if not used:
+        print("retrieval found nothing; the model will have to `search` for itself")
+
+    print(f"warming: {a.max_turns} turn cap, gate `cargo check --workspace --all-targets`",
+          flush=True)
+    subprocess.run("cargo check --workspace --all-targets", cwd=overlay, shell=True,
+                   capture_output=True,
+                   env=dict(os.environ, CARGO_TARGET_DIR=a.target_dir))
+    call([{"role": "user", "content": "ok"}], num_predict=1)
+
+    task = {"name": "adhoc", "prompt": a.prompt,
+            "preload_text": preload, "preload_paths": used}
+    r = run_task(task, overlay, Path(a.target_dir), a.phases, brief,
+                 transcript=a.transcript, max_turns=a.max_turns, reset=False,
+                 propagate=a.propagate)
+
+    diff = subprocess.run(["git", "diff"], cwd=overlay, capture_output=True,
+                          text=True).stdout
+    print("\n" + "=" * 66)
+    print(f"turns {r['turns']}   wall {r['wall_s']}s   gate {'GREEN' if r['final_check_ok'] else 'RED'}"
+          f"   edits {r['edit_actions']}/{r['edits_applied']}/{r['edits_ok_first_apply']}")
+    if r["refusals"]:
+        print("refusals:", ", ".join(r["refusals"]))
+    print("=" * 66)
+    if not diff.strip():
+        print("no changes were made.")
+        return 1
+    patch = work / "changes.patch"
+    patch.write_text(diff)
+    print(diff)
+    print("=" * 66)
+    if not r["final_check_ok"]:
+        print("the gate is RED, so this patch does not compile. Not offered for apply.")
+        print(f"patch written anyway for inspection: {patch}")
+        return 1
+    print(f"patch written to {patch}")
+    print(f"apply with:  git -C {repo} apply {patch}")
+    return 0
 
 
 # -------------------------------------------------------------------- tasks
@@ -600,11 +1025,22 @@ def main():
     ap.add_argument("--target-dir", default="/tmp/hg-m0-target")
     ap.add_argument("--phases", type=int, default=1, choices=[1, 2])
     ap.add_argument("--task", default=None)
-    ap.add_argument("--brief", default=str(HERE / "dipper-brief.md"))
+    ap.add_argument("--brief", default=None,
+                    help="project brief file; free-form mode generates a "
+                         "structural one from Cargo.toml if omitted")
     ap.add_argument("--no-brief", action="store_true",
                     help="run without the project brief, for the index-value A/B")
     ap.add_argument("--out", default=None, help="write the result JSON here")
     ap.add_argument("--transcript", default=None, help="append a per-turn JSONL event log here")
+    ap.add_argument("-p", "--prompt", default=None,
+                    help="free-form mode: one ad-hoc task against a real repo")
+    ap.add_argument("--propagate", action="store_true",
+                    help="RFC-0003 §3 mechanical propagation. UNSAFE until M1: the "
+                         "lexical reference set renamed 84 unrelated sites on dipper")
+    ap.add_argument("--work", default="/tmp/hg-work",
+                    help="where the overlay and the output patch go")
+    ap.add_argument("--max-turns", type=int, default=MAX_TURNS,
+                    help="turn cap per task; RFC-0003 §6 measures 12 against 24")
     ap.add_argument("--trials", type=int, default=1,
                     help="repeat the whole suite N times; §12.1 rule 4 wants three")
     ap.add_argument("--selftest", action="store_true",
@@ -618,7 +1054,13 @@ def main():
         print("all oracles fail on a pristine tree" if not bad else f"{bad} oracle(s) useless")
         return 1 if bad else 0
 
-    brief = "" if a.no_brief else (Path(a.brief).read_text() if Path(a.brief).exists() else "")
+    if a.prompt:
+        print(f"model={MODEL} host={HOST} repo={repo}")
+        return free_form(a, repo)
+
+    suite_brief = Path(a.brief) if a.brief else HERE / "dipper-brief.md"
+    brief = "" if a.no_brief else (suite_brief.read_text()
+                                   if suite_brief.exists() else "")
     tasks = [t for t in TASKS if a.task in (None, t["name"])]
 
     print(f"model={MODEL} host={HOST} phases={a.phases} brief={not a.no_brief} repo={repo}")
@@ -637,7 +1079,8 @@ def main():
         for t in tasks:
             print(f"\n=== {t['name']}{f' (trial {trial})' if a.trials > 1 else ''} ===", flush=True)
             r = run_task(t, repo, Path(a.target_dir), a.phases, brief,
-                         transcript=a.transcript)
+                         transcript=a.transcript, max_turns=a.max_turns,
+                         propagate=a.propagate)
             r["trial"] = trial
             results.append(r)
             print("   ", json.dumps(r), flush=True)
@@ -651,6 +1094,7 @@ def main():
     med_turn = all_turns[len(all_turns) // 2] if all_turns else 0
     summary = {
         "model": MODEL, "host": HOST, "phases": a.phases, "brief": not a.no_brief,
+        "max_turns": a.max_turns, "propagate": a.propagate,
         "trials": a.trials,
         "repo": str(repo), "repo_rev": subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"], cwd=repo, capture_output=True,
