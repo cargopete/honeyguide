@@ -122,6 +122,37 @@ Then the gate runs once over the whole batch, and the result is reported as one
 change. Sites that were skipped are named in the observation, because a partial
 propagation the model does not know about is worse than none.
 
+### 3.2a Measured: a lexical reference set is not merely approximate, it is wrong
+
+Written after prototyping §3.2 with ripgrep as a stand-in for `scip.sqlite`, on
+the theory that a whole-token search would be a rough version of the right
+answer. It is not a rough version of anything.
+
+Renaming `Catalogue::count` to `Catalogue::matches` on `dipper`, the lexical
+propagation rewrote **84 sites across 15 files**. `picker.rs` took 30 of them,
+`wire.rs` 16, `search.rs` 11. Not one was a reference to the renamed method. They
+were `Iterator::count()`, struct fields named `count`, and local bindings named
+`count`, in crates that do not depend on `dipper-index` at all.
+
+The reason is not a tuning failure and no threshold fixes it. A token search
+cannot distinguish a method on one type from an identically named method on
+another, and common Rust identifiers — `count`, `len`, `get`, `new`, `id` — are
+exactly the ones people rename. Applying an edit to a site that merely looks
+right is fuzzy application, which RFC-0001 §7 forbids by name and for precisely
+this consequence: a harness silently corrupting files.
+
+**So §3 is blocked on real reference data, and the ordering in §8 changes
+accordingly.** Everything else in this section survives unaltered — the detection
+test, the on-disk verification, the gate, the skip-and-report behaviour — because
+only the source of the reference set was wrong. `scip.sqlite` answers "every
+reference to *this* symbol", which is the question being asked, and at that point
+`propagate_rename` becomes correct without changing.
+
+Until then it is behind `--propagate`, off by default, documented as unsafe. The
+detection half is unit-tested at 10/10 including the cases §9 asked for, and the
+string and comment masking is exact, so the machinery is ready for a reference
+set that deserves it.
+
 ### 3.3 Why this is safe
 
 Three defences, and they are the same three the design already relies on.
@@ -306,8 +337,17 @@ may reduce what the expensive ones have to do.
 |---|---|---|---|---|
 | 1 | Turn cap 12 → 24 (§6) | minutes | unknown, possibly nil | no change in oracle rate |
 | 2 | Resample on stall (§4) | hours | stall aborts 12/15 down | stall aborts unmoved |
-| 3 | Mechanical propagation (§3) | days | `rename` 0/3 → passing | `rename` still 0/3 |
-| 4 | Escalation (§5) | days | the residue, whatever it is | escalation carries everything |
+| 3 | **`hg-index` structural pass** | days | none directly; unblocks 4 | SCIP references unusable |
+| 4 | Mechanical propagation (§3) | days | `rename` 0/3 → passing | `rename` still 0/3 |
+| 5 | Escalation (§5) | days | the residue, whatever it is | escalation carries everything |
+
+Item 3 was not in the first draft of this table. It is here because §3.2a
+measured what a lexical reference set does and the answer was 84 wrong edits in
+15 files. Propagation cannot be built before the index that makes it correct, so
+the structural pass — `rust-analyzer scip` ingest, symbols, references — moves
+from "M1, later" to "prerequisite". It needs nothing from the semantic pass,
+which is just as well, since Q4 says the semantic pass has no evidence behind it
+yet.
 
 Each lands with the same instrument: the five-task suite, three trials, both
 models, oracle rate as the headline (§12), FACP reported alongside as the
