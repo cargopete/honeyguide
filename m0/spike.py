@@ -168,6 +168,86 @@ def fmt_file(path: Path, edition: str) -> bool:
     return path.read_text() != before
 
 
+# ------------------------------------------------- escalation (RFC-0003 §5)
+
+ESCALATE_MODEL = os.environ.get("HG_ESCALATE_MODEL", "sonnet")
+
+ESCALATE_PROMPT = """\
+You are being asked for one edit, by an automated harness. A small local model \
+is driving a coding task and has become stuck. Do not explain, do not \
+investigate, do not use tools. Reply with one fenced json block and nothing else.
+
+The task it was given:
+{task}
+
+The file it is editing: {path}
+
+What it last tried, which did not work:
+--- search ---
+{search}
+--- replace ---
+{replace}
+
+Why it failed:
+{why}
+
+The relevant region of the file as it stands on disk right now:
+{region}
+
+Reply with exactly this shape, where `search` appears **verbatim and exactly \
+once** in the region above, and `replace` is what it should become:
+
+```json
+{{"search": "...", "replace": "..."}}
+```
+"""
+
+FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
+
+
+def escalate(task_prompt, path, search, replace, why, region, model=None,
+             timeout=180):
+    """Hand one stuck edit to the strong model. RFC-0003 §5.2: one edit, never
+    the task, because RFC-0002 §2 established that cost scales with
+    `turns x context` and a single-turn request carrying a few hundred lines is
+    the cheap corner of that product.
+
+    Containment per RFC-0002 §4: `Read Grep Glob` and no write capability, so
+    the reply is advice and the harness applies it through the ordinary
+    unique-match check and the ordinary gate. An escalated edit is not
+    privileged; the strong model is better, not trusted.
+    """
+    prompt = ESCALATE_PROMPT.format(task=task_prompt, path=path, search=search,
+                                    replace=replace, why=why, region=region)
+    try:
+        p = subprocess.run(
+            ["claude", "-p", "--model", model or ESCALATE_MODEL,
+             "--output-format", "json", "--allowed-tools", "Read", "Grep", "Glob"],
+            input=prompt, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "escalation timed out"
+    if p.returncode != 0:
+        return None, f"claude -p failed: {(p.stderr or '').strip()[:160]}"
+    try:
+        envelope = json.loads(p.stdout)
+        body = envelope.get("result") or ""
+        cost = envelope.get("total_cost_usd")
+    except Exception:
+        return None, "claude -p emitted nothing parseable"
+
+    m = FENCE.search(body) or re.search(r"(\{.*\})", body, re.S)
+    if not m:
+        return None, "no json block in the reply"
+    try:
+        edit = json.loads(m.group(1))
+    except Exception:
+        return None, "the json block did not parse"
+    if not edit.get("search") or not edit.get("replace"):
+        return None, "the reply carried no usable search/replace"
+    edit["_cost_usd"] = cost
+    return edit, None
+
+
 # ------------------------------------------- mechanical propagation (RFC-0003 §3)
 
 SCIP_REFS_BIN = REPO_ROOT / "target" / "debug" / "hg-scip-refs"
@@ -388,7 +468,7 @@ class Session:
     """One task attempt against one overlay."""
 
     def __init__(self, repo: Path, target_dir: Path, check_cmd, propagate=False,
-                 scip=None):
+                 scip=None, escalate_to=None):
         self.repo = repo
         self.env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir))
         self.check_cmd = check_cmd
@@ -758,6 +838,10 @@ def run_task(task, repo, target_dir, phases, brief, verbose=True, transcript=Non
         preload_lines=preload.count("\n"), brief=bool(brief))
 
     wfa_ok = wfa_total = resamples = 0
+    last_edit = last_obs = None
+    escalated = False
+    escalations_used = 0
+    escalation_cost = 0.0
     t0 = time.time()
     turns = 0
     turn_s = []          # §13's second gate is a *median turn*, so time each one
@@ -810,9 +894,48 @@ def run_task(task, repo, target_dir, phases, brief, verbose=True, transcript=Non
             # no-edit check and the stall rule both apply to it.
             obs = s.dispatch(a)
             rec(kind="turn", turn=turns, action=a, obs=obs)
+            if a.get("tool") == "edit" and (a.get("search") or "").strip():
+                last_edit, last_obs = a, obs
             if obs is None:
                 break
             if obs.endswith("ABORT"):
+                # RFC-0003 §5.3: a stall abort is one of the deterministic
+                # triggers. Hand over the single stuck edit, once, then carry on
+                # with the local model driving.
+                if escalate_to and not escalated and last_edit:
+                    escalated = True
+                    ep = (repo / last_edit["path"])
+                    region = ""
+                    if ep.is_file():
+                        body = ep.read_text(errors="replace")
+                        anchor = body.find((last_edit.get("search") or "")[:60])
+                        if anchor < 0:
+                            anchor = 0
+                        lo = max(0, body.rfind("\n", 0, max(0, anchor - 2000)))
+                        region = body[lo:anchor + 4000]
+                    if verbose:
+                        print(f"          -> escalating to {escalate_to} ...", flush=True)
+                    fix, why = escalate(task["prompt"], last_edit["path"],
+                                        last_edit.get("search", ""),
+                                        last_edit.get("replace", ""),
+                                        (last_obs or "")[:1200], region,
+                                        model=escalate_to)
+                    rec(kind="escalation", turn=turns, ok=bool(fix),
+                        why=why, cost=(fix or {}).get("_cost_usd"))
+                    if fix:
+                        escalation_cost += (fix.get("_cost_usd") or 0.0)
+                        s.recent.clear()          # the abort is spent; let it move
+                        s.stalls = 0
+                        obs = s.edit(last_edit["path"], fix["search"], fix["replace"])
+                        escalations_used += 1
+                        if verbose:
+                            print(f"          -> escalated edit: {obs.splitlines()[0][:100]}")
+                        msgs.append({"role": "user", "content":
+                                     "A stronger model was consulted and its edit was applied "
+                                     "by the harness. Result:\n" + obs[:OBS_CAP]})
+                        continue
+                    if verbose:
+                        print(f"          -> escalation failed: {why}")
                 if verbose:
                     print("          -> aborting: stalled three times on the same action")
                 break
@@ -842,6 +965,7 @@ def run_task(task, repo, target_dir, phases, brief, verbose=True, transcript=Non
         "edit_actions": s.edit_actions, "edits_applied": s.edits_applied,
         "edits_ok_first_apply": s.edits_first_apply_ok, "reverts": s.reverts,
         "formatted": s.formatted, "resamples": resamples,
+        "escalations": escalations_used, "escalation_cost_usd": round(escalation_cost, 4),
         "propagated_sites": s.propagated,
         "final_check_ok": ok, "oracle_ok": oracle_ok,
         "refusals": s.refusals,
@@ -1108,7 +1232,8 @@ def free_form(a, repo: Path):
             "preload_text": preload, "preload_paths": used}
     r = run_task(task, overlay, Path(a.target_dir), a.phases, brief,
                  transcript=a.transcript, max_turns=a.max_turns, reset=False,
-                 propagate=a.propagate, resample=a.resample, scip=a.scip)
+                 propagate=a.propagate, resample=a.resample, scip=a.scip,
+                         escalate_to=a.escalate)
 
     diff = subprocess.run(["git", "diff", "HEAD"], cwd=overlay, capture_output=True,
                           text=True).stdout
@@ -1322,6 +1447,10 @@ def main():
     ap.add_argument("--transcript", default=None, help="append a per-turn JSONL event log here")
     ap.add_argument("-p", "--prompt", default=None,
                     help="free-form mode: one ad-hoc task against a real repo")
+    ap.add_argument("--escalate", nargs="?", const=ESCALATE_MODEL, default=None,
+                    metavar="MODEL",
+                    help="RFC-0003 §5: hand one stuck edit to `claude -p` on a stall "
+                         "abort. Defaults to sonnet; costs about $0.13 a call")
     ap.add_argument("--scip", default=None,
                     help="path to an index.scip; required by --propagate")
     ap.add_argument("--resample", action="store_true",
@@ -1373,7 +1502,8 @@ def main():
             print(f"\n=== {t['name']}{f' (trial {trial})' if a.trials > 1 else ''} ===", flush=True)
             r = run_task(t, repo, Path(a.target_dir), a.phases, brief,
                          transcript=a.transcript, max_turns=a.max_turns,
-                         propagate=a.propagate, resample=a.resample, scip=a.scip)
+                         propagate=a.propagate, resample=a.resample, scip=a.scip,
+                         escalate_to=a.escalate)
             r["trial"] = trial
             results.append(r)
             print("   ", json.dumps(r), flush=True)
@@ -1392,7 +1522,7 @@ def main():
     med_turn = all_turns[len(all_turns) // 2] if all_turns else 0
     summary = {
         "model": MODEL, "host": HOST, "phases": a.phases, "brief": not a.no_brief,
-        "max_turns": a.max_turns, "propagate": a.propagate, "resample": a.resample,
+        "max_turns": a.max_turns, "propagate": a.propagate, "resample": a.resample, "escalate": a.escalate,
         "trials": a.trials,
         "repo": str(repo), "repo_rev": subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"], cwd=repo, capture_output=True,
