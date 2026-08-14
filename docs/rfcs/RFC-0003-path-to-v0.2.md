@@ -274,7 +274,53 @@ derive with certainty, and asks the model for anything requiring a value.** For
 turn with the missing field named, which is §6.3's provision principle applied to
 repair, but it must not invent the value. Renames first; the rest on evidence.
 
-## 4. Resample on a stall, do not only refuse
+## 4. Resample on a stall — DONE, and it does not work
+
+Measured: three trials, driver, `--resample` against the same baseline.
+
+| | baseline | resample |
+|---|---|---|
+| **Tasks completed** | **6/15** | **5/15** |
+| Stall aborts | 12/15 | **8/15** |
+| FACP, of edits proposed | 6/24 = 25% | 6/16 = **38%** |
+| `missing_args` refusals | 10 | **20** |
+| WFA | 90/90 | 168/168 |
+| Median turn | 8.7s | 12.3s |
+| Total wall | 949s | 1,364s |
+| Extra generations | — | 97 |
+
+**The mechanism works and the outcome does not follow.** Stall aborts fall by a
+third. Per-edit quality rises: fewer proposals, more of them landing. Completions
+do not move, 5 against 6 being well inside the trial-to-trial spread this suite
+has shown all along. The cost is 44% more wall-clock and 97 extra generations.
+
+The diagnosis in §4.1 was wrong, and that is worth more than the feature. It
+assumed the model repeats itself because temperature 0.3 keeps re-drawing the
+same unlucky sample, so a re-roll would find a better action. What re-rolling
+reliably finds is a **different** action that is no better, and at higher
+temperature it finds twice as many argument-less edits: `missing_args` doubled,
+10 to 20. Sampling was never the constraint. The model is not stuck because its
+distribution is narrow; it is stuck because it does not know what to do next, and
+drawing again does not create knowledge.
+
+**Verdict: off by default.** The flag stays for future comparison, since the
+stall-abort reduction is real and might matter in combination with something
+else, but nothing should be built on top of it.
+
+Two consequences for the rest of this document.
+
+**§5 escalation moves up.** If more local sampling cannot rescue a stuck turn,
+the only things that can are a better model or a deterministic answer. That is
+precisely escalation and mechanical propagation, and this result is evidence for
+both at the expense of every cheap local trick.
+
+**A kill criterion must name the outcome, not the mechanism.** §8 said this one
+died if "stall aborts unmoved". They moved, and the feature still failed, because
+the criterion measured the thing being fixed rather than the thing worth having.
+§12 already concluded that the oracle rate is the real number; the criteria
+should have said so. Corrected in §8.
+
+## 4a. The original argument, kept
 
 The cheapest change on the list, and it attacks F4 directly.
 
@@ -444,13 +490,25 @@ project's credibility rests on that habit more than on any feature.
 Strictly in this order, because each is cheaper than the next and the cheap ones
 may reduce what the expensive ones have to do.
 
-| | Change | Effort | Expected effect | Kill criterion |
-|---|---|---|---|---|
-| 1 | Turn cap 12 → 24 (§6) | minutes | unknown, possibly nil | no change in oracle rate |
-| 2 | Resample on stall (§4) | hours | stall aborts 12/15 down | stall aborts unmoved |
-| 3 | **`hg-index` structural pass** | days | none directly; unblocks 4 | SCIP references unusable |
-| 4 | Mechanical propagation (§3) | days | `rename` 0/3 → passing | `rename` still 0/3 |
-| 5 | Escalation (§5) | days | the residue, whatever it is | escalation carries everything |
+Every kill criterion names the **oracle completion rate**, not the mechanism the
+change operates on. §4 is why: it was written to die if stall aborts stayed at
+12/15, they fell to 8/15, and the feature failed anyway because completions did
+not move. A criterion that measures the symptom will keep a change that treats
+the symptom.
+
+| | Change | Effort | Expected effect | Kill criterion | Outcome |
+|---|---|---|---|---|---|
+| 1 | Turn cap 12 → 24 (§6) | minutes | unknown, possibly nil | oracle rate unmoved | **killed**: 6/15 → 8/15, but the cap was not the cause |
+| 2 | Resample on stall (§4) | hours | stall aborts down | oracle rate unmoved | **killed**: aborts 12→8, oracle 6→5 |
+| 3 | `hg-index` structural pass | days | none directly; unblocks 4 | SCIP references unusable | **done**: 3 exact refs against grep's 84 |
+| 4 | Mechanical propagation (§3) | days | `rename` 0/3 → passing | `rename` still 0/3 | built; needs a suite run to score |
+| 5 | Escalation (§5) | days | the residue, whatever it is | escalation carries everything | next |
+
+Two of the four cheap local tricks are dead, and both died for the same reason:
+they gave the model more room rather than more information. §3 and §5 are the two
+that give it information — a substitution the harness performs itself, and an
+answer from a model that knows. That is the shape of the thesis, and the cheap
+items were worth running precisely to establish that nothing cheaper works.
 
 Item 3 was not in the first draft of this table. It is here because §3.2a
 measured what a lexical reference set does and the answer was 84 wrong edits in
