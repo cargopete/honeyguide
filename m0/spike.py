@@ -226,12 +226,46 @@ TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 DEFINES = r"\b(fn|struct|enum|trait|type|mod|const|static|union)\s+{}\b"
 
 
+DEF_SITE = re.compile(r"\b(fn|struct|enum|trait|type|mod|const|static|union)\s+"
+                      r"([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def detect_rename_by_definition(search, replace):
+    """Did this edit rename exactly one *definition*? Returns (old, new) or None.
+
+    This replaces a whole-text comparison that was correct and useless. Requiring
+    `search` and `replace` to be identical but for one token means the edit must
+    be minimal, and models do not write minimal edits. Measured: asked to rename
+    `Catalogue::count`, the driver emitted
+
+        search:  "    /// How many documents match a query.\\n    pub fn count(..."
+        replace: "pub fn matches(..."
+
+    which renames the method, drops the doc comment and drops the indentation.
+    A pure-rename test says no, propagation never fires, and the whole feature
+    sat inert through a fifteen-task suite doing nothing at all.
+
+    Comparing definitions instead ignores everything that is not a declaration.
+    Still conservative: exactly one definition name may disappear and exactly one
+    appear, and their keywords must match, or this is not a rename.
+    """
+    a = DEF_SITE.findall(search)
+    b = DEF_SITE.findall(replace)
+    gone = [d for d in a if d not in b]
+    came = [d for d in b if d not in a]
+    if len(gone) != 1 or len(came) != 1:
+        return None
+    (kind_a, old), (kind_b, new) = gone[0], came[0]
+    if kind_a != kind_b or old == new:
+        return None
+    return old, new
+
+
 def detect_rename(search, replace):
     """Is this edit a pure rename of one identifier? Returns (old, new) or None.
 
-    Conservative by design: a false negative costs nothing and a false positive
-    edits code nobody asked to change. It requires the two texts to be identical
-    except for exactly one identifier token, differing in exactly one position.
+    Kept for the strictest case and for its tests; `detect_rename_by_definition`
+    is what the gate uses, because this one almost never matches real output.
     """
     a, b = TOKEN.findall(search), TOKEN.findall(replace)
     if len(a) != len(b) or TOKEN.sub("\0", search) != TOKEN.sub("\0", replace):
@@ -490,7 +524,7 @@ class Session:
             self.formatted += 1
             note += " The harness reformatted the file with rustfmt."
         if self.propagate and self.scip:
-            ren = detect_rename(search, replace)
+            ren = detect_rename_by_definition(search, replace)
             pos = _def_pos(text, search, ren[0]) if ren else None
             if pos:
                 rel = str(p.relative_to(self.repo.resolve()))

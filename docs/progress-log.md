@@ -2,6 +2,49 @@
 
 Newest first. One entry per meaningful slice of work.
 
+## 2026-08-14 (later) - propagation works, and three trials cannot measure anything
+
+Five configurations of the same five-task suite, three trials each, and the
+spread settles a methodological question that outranks all of them.
+
+| config | per trial | total |
+|---|---|---|
+| baseline, cap 12 | 3, 1, 2 | 6/15 |
+| cap 24 | 2, 3, 3 | 8/15 |
+| resample | 2, 2, 1 | 5/15 |
+| propagate, detector inert | 3, 3, 3 | **9/15** |
+| propagate, detector live | 3, 1, 0 | **4/15** |
+
+Pooled 32/75 = 43%, and a single fifteen-task arm at that rate has a 95%
+interval of 3/15 to 10/15. Every result above sits inside it. The best score of
+the day came from a run where the feature under test **fired zero times**; the
+worst came from the run where it worked. **Three trials cannot distinguish these
+configurations**, and detecting a twenty-point difference needs about 20 trials
+per arm rather than 3. Every completion-rate comparison made today is withdrawn,
+recorded as RFC-0003 §0.
+
+What survives is behavioural and deterministic, which is the same asymmetry
+§12.1 found for timing and now looks like a standing property of this domain.
+
+**Propagation works.** With the detector fixed it fired, renamed exactly the
+three sites the compiler names, and `rename` completed — the first time that task
+has passed with the mechanism live. Against grep's 84 wrong sites in 15 files.
+
+**And it was inert before that, which is the better lesson.** `detect_rename`
+required `search` and `replace` to be identical but for one token. Correct,
+tested 10/10, safely conservative, and useless: models do not write minimal
+edits. Asked to rename `Catalogue::count`, the driver renamed the method *and*
+dropped the doc comment *and* dropped the indentation, so the test said "not a
+rename" and the whole feature sat inert through a fifteen-task suite while I
+credited it for variance. Replaced by a comparison of *definitions* — one name
+out, one in, same keyword — which matches the real output and is still
+conservative. 11/11 including the exact edit observed.
+
+**Also landed:** rustfmt in the gate, verified against the precise defect that
+prompted it (a correct doc comment indented eight spaces, which compiled and
+would have failed dipper's own `cargo fmt --check` CI). It only runs on files
+that were canonically formatted beforehand.
+
 ## 2026-08-14 - the turn cap buys nothing, and SCIP settles propagation
 
 RFC-0003's two cheapest items measured, and a lexical shortcut caught before it

@@ -9,6 +9,49 @@
 | Evidence | `docs/measurements/2026-08-13-m0-suite.md` |
 | Target | v0.1 (single-site edits, done properly), v0.2 (cascading edits and escalation) |
 
+## 0. Correction: the completion-rate comparisons in this document are underpowered
+
+Added after running five configurations of the same suite. Read this before §4,
+§6 or §8, because it limits what any of them may claim.
+
+| config | per trial | total |
+|---|---|---|
+| baseline, cap 12 | 3, 1, 2 | 6/15 |
+| cap 24 (§6) | 2, 3, 3 | 8/15 |
+| resample (§4) | 2, 2, 1 | 5/15 |
+| propagate, detector inert | 3, 3, 3 | **9/15** |
+| propagate, detector live | 3, 1, 0 | **4/15** |
+
+Pooled: **32/75 = 43%**. A single fifteen-task arm drawn at that rate has a 95%
+interval of **3/15 to 10/15**, and every figure above falls inside it. The
+highest score of the day, 9/15, came from a run in which the feature under test
+**fired zero times** and was therefore identical to the baseline. The lowest,
+4/15, came from the run where it worked.
+
+**Three trials cannot distinguish these configurations.** Detecting a
+twenty-point difference at 80% power needs roughly 97 tasks per arm, which is 20
+trials of this five-task suite, against the 3 used throughout.
+
+So every claim in this document of the form "configuration X changed the
+completion rate" is withdrawn. What survives is everything **behavioural and
+deterministic**, which is the same asymmetry RFC-0001 §12.1 recorded for timing
+and is apparently a standing property of this domain:
+
+- the reference-set comparison, 84 wrong sites against 3 correct ones, which is
+  deterministic and does not involve sampling at all;
+- propagation firing and producing exactly the three sites the compiler names;
+- the turn cap never being reached in 14 of 15 runs;
+- `missing_args` doubling under resampling, 10 to 20;
+- WFA at 100% across several hundred turns;
+- every gate, overlay and index timing.
+
+Consequences for the eval design, and they are not optional if this project
+intends to make quantitative claims: the smoke suite needs more tasks (§12's
+"roughly ten" rather than five), comparisons need trial counts in the tens, and
+every reported rate needs an interval beside it. Until then the suite is a
+**debugging instrument**, which it has been excellent at — seven harness defects,
+an unsafe propagation, an inert detector — and not a measuring one.
+
 ## 1. Summary
 
 M0 has been run in full: five tasks, three trials, two models, 188 turns. It
@@ -498,10 +541,10 @@ the symptom.
 
 | | Change | Effort | Expected effect | Kill criterion | Outcome |
 |---|---|---|---|---|---|
-| 1 | Turn cap 12 → 24 (§6) | minutes | unknown, possibly nil | oracle rate unmoved | **killed**: 6/15 → 8/15, but the cap was not the cause |
-| 2 | Resample on stall (§4) | hours | stall aborts down | oracle rate unmoved | **killed**: aborts 12→8, oracle 6→5 |
+| 1 | Turn cap 12 → 24 (§6) | minutes | unknown, possibly nil | oracle rate unmoved | **killed on mechanism**: the cap was reached in 1 of 15 runs. The rate comparison is void (§0) |
+| 2 | Resample on stall (§4) | hours | stall aborts down | oracle rate unmoved | **killed on mechanism**: `missing_args` doubled. The rate comparison is void (§0) |
 | 3 | `hg-index` structural pass | days | none directly; unblocks 4 | SCIP references unusable | **done**: 3 exact refs against grep's 84 |
-| 4 | Mechanical propagation (§3) | days | `rename` 0/3 → passing | `rename` still 0/3 | built; needs a suite run to score |
+| 4 | Mechanical propagation (§3) | days | `rename` 0/3 → passing | `rename` still 0/3 | **works**: fires, renames exactly the 3 sites the compiler names, and `rename` completed for the first time. Unscored (§0) |
 | 5 | Escalation (§5) | days | the residue, whatever it is | escalation carries everything | next |
 
 Two of the four cheap local tricks are dead, and both died for the same reason:
