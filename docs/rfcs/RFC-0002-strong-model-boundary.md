@@ -7,6 +7,7 @@
 | Revision | 1 (2026-08-12) |
 | Depends on | RFC-0001 §5 (the index), §9 (escalation) |
 | Pinned to | Claude Code **2.1.228**, Max subscription, `--model opus` |
+| Re-checked | **2.1.231** on 2026-08-14: preamble 32,740 -> 44,774, spawn gap gone (§2.1) |
 
 ## 1. Summary
 
@@ -49,6 +50,33 @@ invocations.
 
 The cache is `ephemeral_1h`, so a run that takes more than an hour, or an index
 refresh the next morning, pays creation again rather than read.
+
+**Re-measured 2026-08-14 on 2.1.231, and the numbers have moved.** Same probe,
+`--model sonnet`, from `/tmp`:
+
+| | 2.1.228, opus | 2.1.231, sonnet |
+|---|---|---|
+| Wall | 4.1s | **1.8s** |
+| API | 2.1s | 1.8s |
+| Cache creation | 16,754 | 19,636 |
+| Cache read | 15,986 | 25,138 |
+| **Preamble total** | **32,740** | **44,774** |
+| Reported cost | $0.1756 | $0.1254 |
+
+The preamble has grown by **37%** in three patch releases, which is the number
+this document's transport argument rests on, so it is worth re-checking rather
+than citing. The spawn gap has closed almost entirely: wall and API time are now
+within 20ms of each other, so the "two seconds of process spawn" that motivated
+one persistent process per run is no longer the cost it was. The preamble still
+is, and it argues the same way.
+
+Two consequences. The pin at the top of this document should be read as "these
+figures decay"; anything quantitative here wants re-measuring before it is
+leaned on. And for **escalation** (RFC-0003 §5), where each call is one turn
+carrying a few hundred lines, a per-escalation spawn now costs 1.8s and about
+$0.13 — cheap enough that the persistent process specified in §3 is an
+optimisation rather than a necessity for that path. It remains necessary for
+index generation, where the invocation count is per-module.
 
 ### 2.2 An agentic call is multi-turn, and turns are the cost
 
