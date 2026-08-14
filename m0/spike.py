@@ -57,6 +57,25 @@ RESAMPLE_TEMPS = (0.3, 0.7, 1.0)    # RFC-0003 §4: the stall re-roll ladder
 ERRLINE = re.compile(r"^error(\[[A-Z]\d+\])?: (.*)$", re.M)
 
 
+def wilson(k, n, z=1.96):
+    """95% Wilson interval for k successes in n. Reported beside every rate
+    because RFC-0003 §0: five configurations of this suite scored 4/15 to 9/15
+    and every one of them sat inside a single interval. A bare rate from a small
+    sample is not a measurement, it is an anecdote with a denominator."""
+    if not n:
+        return 0.0, 0.0
+    p = k / n
+    d = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / d
+    half = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / d
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def rate(k, n):
+    lo, hi = wilson(k, n)
+    return f"{k}/{n} = {100 * k / max(n, 1):.0f}%  [95% CI {100 * lo:.0f}-{100 * hi:.0f}%]"
+
+
 def count_errors(diag):
     """Distinct rustc errors, ignoring cargo's own summary lines. The gate's
     rollback rule keys off whether this is falling, not off how many turns have
@@ -1187,6 +1206,79 @@ TASKS = [
                "that writes the record's identifier followed by the score in parentheses, "
                "for example `nasa-apollo (12.5)`.",
      "oracle_cmd": DISPLAY_ORACLE},
+    # --- added when §0 showed five tasks could not measure anything ---------
+    # §12's seed set always said "roughly ten". Two of these are chosen because
+    # they punish a lexical approach specifically: `dipper-web` declares its own
+    # `Hit`, and `Fields` its own `downloads`, so a token rename corrupts them
+    # while a SCIP rename must leave them alone.
+    {"name": "rename_type", "preload": [IDX],
+     "prompt": "In crates/dipper-index/src/lib.rs, rename the public struct `Hit` to "
+               "`SearchHit`. Update every use of it in the workspace too.",
+     "oracle_cmd": (f"grep -q 'pub struct SearchHit' {IDX} && ! grep -q 'pub struct Hit' {IDX} "
+                    "&& grep -q 'SearchHit' crates/dipper-cli/src/main.rs "
+                    # dipper-web has an unrelated `Hit` of its own; touching it is a failure
+                    "&& grep -q 'pub struct Hit' crates/dipper-web/src/search.rs "
+                    f"&& {TESTS}")},
+    {"name": "rename_field", "preload": [IDX],
+     "prompt": "In crates/dipper-index/src/lib.rs, rename the public field `downloads` on "
+               "the `Record` struct to `download_count`. Update every use of it.",
+     "oracle_cmd": (f"grep -q 'pub download_count: u64' {IDX} "
+                    # the private `Fields` struct has its own `downloads`, on the same
+                    # line as a use of Record's in one place. It must survive.
+                    f"&& grep -q 'downloads: Field' {IDX} "
+                    f"&& grep -q 'f.downloads => record.download_count' {IDX} "
+                    f"&& {TESTS}")},
+    {"name": "add_error_variant", "preload": [IDX],
+     "prompt": "In crates/dipper-index/src/lib.rs, add a new variant `Locked` to the `Error` "
+               "enum, carrying no data, with the thiserror message \"index is locked\".",
+     "oracle_cmd": (f"grep -q 'index is locked' {IDX} && grep -qE '^\\s*Locked,' {IDX} "
+                    f"&& {TESTS}")},
+    {"name": "derive_hash", "preload": [IDX],
+     "prompt": "In crates/dipper-index/src/lib.rs, make the `Record` struct usable as a "
+               "hash-map key by adding `Hash` to its derive list.",
+     "oracle_cmd": r"""
+mkdir -p crates/dipper-index/tests
+cat > crates/dipper-index/tests/hg_oracle.rs <<'EOF'
+use dipper_index::Record;
+use std::collections::HashSet;
+
+#[test]
+fn record_is_hashable() {
+    let mut set = HashSet::new();
+    set.insert(Record { identifier: "a".into(), ..Default::default() });
+    set.insert(Record { identifier: "a".into(), ..Default::default() });
+    assert_eq!(set.len(), 1);
+}
+EOF
+cargo test -p dipper-index --test hg_oracle --quiet
+rc=$?
+rm -f crates/dipper-index/tests/hg_oracle.rs
+exit $rc
+"""},
+    {"name": "add_method", "preload": [IDX],
+     "prompt": "In crates/dipper-index/src/lib.rs, add a public method to `Catalogue` with "
+               "the signature `pub fn has(&self, identifier: &str) -> Result<bool>`, which "
+               "returns whether `get` finds an item with that identifier.",
+     "oracle_cmd": r"""
+mkdir -p crates/dipper-index/tests
+cat > crates/dipper-index/tests/hg_oracle.rs <<'EOF'
+use dipper_index::{Catalogue, Record};
+
+#[test]
+fn has_reports_presence() {
+    let cat = Catalogue::in_memory().unwrap();
+    let mut w = cat.writer().unwrap();
+    w.upsert(&Record { identifier: "nasa-apollo".into(), ..Default::default() }).unwrap();
+    w.commit().unwrap();
+    assert!(cat.has("nasa-apollo").unwrap());
+    assert!(!cat.has("nothing-here").unwrap());
+}
+EOF
+cargo test -p dipper-index --test hg_oracle --quiet
+rc=$?
+rm -f crates/dipper-index/tests/hg_oracle.rs
+exit $rc
+"""},
     {"name": "doc_comment", "preload": [IDX],
      "prompt": "In crates/dipper-index/src/lib.rs, the method `Catalogue::is_empty` has no "
                "doc comment. Add a one-line `///` doc comment above it describing what it returns.",
@@ -1308,15 +1400,17 @@ def main():
         "wfa": [wo, wt],
         "facp_applied": [eo, ea], "facp_proposed": [eo, ep],
         "oracle": [sum(1 for r in results if r["oracle_ok"]), len(results)],
+        "oracle_ci": [round(x, 4) for x in
+                      wilson(sum(1 for r in results if r["oracle_ok"]), len(results))],
         "median_turn_s": med_turn,
         "total_wall_s": round(sum(r["wall_s"] for r in results), 1),
         "results": results,
     }
     print("\n" + "=" * 66)
-    print(f"WFA    {wo}/{wt} = {100*wo/max(wt,1):.0f}%")
-    print(f"FACP   {eo}/{ea} = {100*eo/max(ea,1):.0f}%  of edits that applied   (M0 gate G2: 60%)")
-    print(f"       {eo}/{ep} = {100*eo/max(ep,1):.0f}%  of edits proposed")
-    print(f"oracle {summary['oracle'][0]}/{len(results)} tasks actually done")
+    print(f"WFA    {rate(wo, wt)}")
+    print(f"FACP   {rate(eo, ea)}  of edits that applied")
+    print(f"       {rate(eo, ep)}  of edits proposed")
+    print(f"oracle {rate(summary['oracle'][0], len(results))}  <- the quality number (§12)")
     if a.trials > 1:
         # §12.1 rule 4: report every trial, not the flattering one
         for trial in range(1, a.trials + 1):
