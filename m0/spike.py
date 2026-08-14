@@ -873,6 +873,15 @@ def free_form(a, repo: Path):
     work.mkdir(parents=True, exist_ok=True)
     overlay = work / "overlay"
     flags = make_overlay(repo, overlay)
+    # Commit whatever state the working tree was in, inside the throwaway
+    # overlay only, so the final diff shows what *this run* did and not the
+    # user's own uncommitted work. Without this a run reported edits it had not
+    # made, which is the same class of error as an oracle that passes on an
+    # untouched tree.
+    for cmd in (["git", "add", "-A"],
+                ["git", "-c", "user.email=hg@localhost", "-c", "user.name=honeyguide",
+                 "commit", "-q", "--allow-empty", "-m", "hg overlay baseline"]):
+        subprocess.run(cmd, cwd=overlay, capture_output=True)
     print(f"overlay: cp {flags} -> {overlay}")
 
     brief = "" if a.no_brief else (Path(a.brief).read_text()
@@ -895,7 +904,7 @@ def free_form(a, repo: Path):
                  transcript=a.transcript, max_turns=a.max_turns, reset=False,
                  propagate=a.propagate)
 
-    diff = subprocess.run(["git", "diff"], cwd=overlay, capture_output=True,
+    diff = subprocess.run(["git", "diff", "HEAD"], cwd=overlay, capture_output=True,
                           text=True).stdout
     print("\n" + "=" * 66)
     print(f"turns {r['turns']}   wall {r['wall_s']}s   gate {'GREEN' if r['final_check_ok'] else 'RED'}"
@@ -1084,6 +1093,11 @@ def main():
             r["trial"] = trial
             results.append(r)
             print("   ", json.dumps(r), flush=True)
+
+    # Every task resets the repo before it runs, so the final task's edits were
+    # being left behind in a checkout someone else then uses. Put it back.
+    subprocess.run(["git", "checkout", "--", "."], cwd=repo, capture_output=True)
+    subprocess.run(["git", "clean", "-fdq"], cwd=repo, capture_output=True)
 
     ep = sum(r["edit_actions"] for r in results)
     ea = sum(r["edits_applied"] for r in results)
