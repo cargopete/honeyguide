@@ -193,6 +193,46 @@ worth recording because both would have produced confident wrong answers:
 one 22-second index per session, and `propagate_rename` needs only to be handed
 SCIP occurrences instead of grep hits.
 
+### 3.2c Measured: propagation through SCIP is exact, and staleness is real
+
+`hg-scip-refs` resolves a symbol by position and prints its reference sites;
+`propagate_via_scip` in the spike applies the rename at each, verifying the text
+on disk before touching it. Run against `dipper`, renaming `Catalogue::count`:
+
+```
+changed: crates/dipper-cli/src/main.rs (1), crates/dipper-index/src/lib.rs (2)
+skipped: none
+```
+
+Four lines: the definition, the caller in `dipper-cli`, and both callers in the
+crate's own `mod tests`. `picker.rs`, `wire.rs` and `search.rs` — three of the
+fifteen files the lexical version corrupted — are byte-identical. The task that
+neither model completed in twelve attempts is now one edit followed by a
+deterministic substitution.
+
+**The first attempt skipped two of the three sites, and that is the more
+valuable result.** The index had been generated while the working tree carried a
+stale two-line duplication, so every line number past 181 was off by two.
+Verification found the text was not where the index said, and skipped rather
+than guessed:
+
+```
+skipped: crates/dipper-index/src/lib.rs:365 (text has moved)
+         crates/dipper-index/src/lib.rs:364 (text has moved)
+```
+
+That is §5.2 working exactly as written — the index is a map, never ground truth
+for file contents — and it was demonstrated by accident rather than by a test,
+which is the most convincing way to learn it. A propagation built on trust in
+the index would have renamed two arbitrary five-character spans. The consequence
+for the design is that **the verification step is not belt-and-braces, it is
+load-bearing**, and refresh (§5.2) must run whenever the overlay diverges enough
+to move lines.
+
+Cost note: a warm re-index took **5.2s** against 22.1s cold, so a per-session
+index is cheaper than the first measurement suggested, and an incremental
+refresh cheaper still.
+
 ### 3.3 Why this is safe
 
 Three defences, and they are the same three the design already relies on.

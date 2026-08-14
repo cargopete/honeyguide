@@ -53,6 +53,7 @@ MAX_EDIT_LINES = 200
 OBS_CAP = 4000          # characters; observations are truncated hard (§8.5)
 GUTTER = re.compile(r"^\s*\d+\|", re.M)
 MAX_NO_PROGRESS = 3     # red gates without reducing the error count, then roll back
+RESAMPLE_TEMPS = (0.3, 0.7, 1.0)    # RFC-0003 §4: the stall re-roll ladder
 ERRLINE = re.compile(r"^error(\[[A-Z]\d+\])?: (.*)$", re.M)
 
 
@@ -91,11 +92,11 @@ def _post(payload, timeout=420, retries=3):
             time.sleep(15 * attempt)
 
 
-def call(messages, schema=None, num_predict=600):
+def call(messages, schema=None, num_predict=600, temperature=0.3):
     payload = {
         "model": MODEL, "messages": messages, "stream": False, "think": False,
         "keep_alive": "30m",
-        "options": {"temperature": 0.3, "top_p": 0.95, "top_k": 20, "min_p": 0.05,
+        "options": {"temperature": temperature, "top_p": 0.95, "top_k": 20, "min_p": 0.05,
                     "num_ctx": 32768, "num_predict": num_predict},
     }
     if schema:
@@ -109,7 +110,117 @@ def call(messages, schema=None, num_predict=600):
         return _post(payload)
 
 
+# --------------------------------------------------------------- formatting
+
+def _edition(repo: Path) -> str:
+    """Whatever the workspace declares, because rustfmt parses differently per
+    edition and guessing wrong turns a formatter into a syntax error."""
+    import tomllib
+    try:
+        cfg = tomllib.loads((repo / "Cargo.toml").read_text())
+    except Exception:
+        return "2021"
+    return str(cfg.get("workspace", {}).get("package", {}).get("edition")
+               or cfg.get("package", {}).get("edition") or "2021")
+
+
+def fmt_clean(path: Path, edition: str) -> bool:
+    p = subprocess.run(["rustfmt", "--edition", edition, "--check", str(path)],
+                       capture_output=True, text=True)
+    return p.returncode == 0
+
+
+def fmt_file(path: Path, edition: str) -> bool:
+    """Format one file. Returns whether it changed.
+
+    The gate checks that code compiles, not that it is presentable, and the first
+    live free-form run produced a correct doc comment indented eight spaces
+    instead of four. It compiled, so the gate passed it, and it would have failed
+    the target repository's own `cargo fmt --check` CI.
+
+    Formatting is deterministic and costs no model tokens, so the harness does it
+    rather than asking. It only runs on a file that was *already* canonically
+    formatted before the edit: reformatting someone's non-canonical file would
+    bury a one-line change in a thousand-line diff, and that is not ours to do.
+    """
+    before = path.read_text()
+    subprocess.run(["rustfmt", "--edition", edition, str(path)],
+                   capture_output=True, text=True)
+    return path.read_text() != before
+
+
 # ------------------------------------------- mechanical propagation (RFC-0003 §3)
+
+SCIP_REFS_BIN = REPO_ROOT / "target" / "debug" / "hg-scip-refs"
+
+
+def _def_pos(text, search, old):
+    """Zero-based line and column of the definition of `old` within the matched
+    `search`, in the pre-edit file. SCIP is queried by position, not by name,
+    which is the entire point (§3.2a)."""
+    base = text.index(search)
+    m = re.search(DEFINES.format(re.escape(old)), search)
+    if not m:
+        return None
+    off = base + m.end() - len(old)
+    return text.count("\n", 0, off), off - (text.rfind("\n", 0, off) + 1)
+
+
+def propagate_via_scip(repo: Path, scip: Path, rel: str, line: int, col: int,
+                       old: str, new: str, snapshot=None):
+    """Rename every reference to the symbol *defined at this position*.
+
+    The reference set comes from `hg-scip-refs`, which resolves it through
+    rust-analyzer rather than by matching text. Each site is still verified
+    against what is on disk before it is touched, because §5.2 is explicit that
+    the index is a map and never ground truth for file contents: an index built
+    before earlier edits in this session may point at a line that has moved.
+    A site that does not verify is skipped and named, never guessed at.
+    """
+    if not SCIP_REFS_BIN.is_file() or not Path(scip).is_file():
+        return [], [], "no SCIP index"
+    p = subprocess.run([str(SCIP_REFS_BIN), str(scip), rel, str(line), str(col)],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        return [], [], f"hg-scip-refs failed: {p.stderr.strip()[:120]}"
+    try:
+        data = json.loads(p.stdout)
+    except Exception:
+        return [], [], "hg-scip-refs emitted nothing parseable"
+    if not data.get("symbol"):
+        return [], [], "no symbol is defined at that position"
+
+    edits = collections.defaultdict(list)
+    for r in data["refs"]:
+        edits[r["path"]].append((r["line"], r["col_start"], r["col_end"]))
+
+    changed, skipped = [], []
+    for rel_path, sites in edits.items():
+        f = (repo / rel_path).resolve()
+        if not f.is_file():
+            skipped.append(f"{rel_path} (missing)")
+            continue
+        orig = f.read_text(errors="replace")
+        lines = orig.splitlines(keepends=True)
+        n = 0
+        # bottom-up, so earlier edits do not move later columns on the same line
+        for ln, cs, ce in sorted(sites, reverse=True):
+            if ln >= len(lines):
+                skipped.append(f"{rel_path}:{ln + 1} (past end of file)")
+                continue
+            body = lines[ln]
+            if body[cs:ce] != old:
+                skipped.append(f"{rel_path}:{ln + 1} (text has moved)")
+                continue
+            lines[ln] = body[:cs] + new + body[ce:]
+            n += 1
+        if n:
+            if snapshot:
+                snapshot(f, orig)
+            f.write_text("".join(lines))
+            changed.append((rel_path, n))
+    return changed, skipped, None
+
 
 TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 DEFINES = r"\b(fn|struct|enum|trait|type|mod|const|static|union)\s+{}\b"
@@ -223,7 +334,8 @@ def propagate_rename(repo: Path, old: str, new: str, skip: Path, snapshot=None):
 class Session:
     """One task attempt against one overlay."""
 
-    def __init__(self, repo: Path, target_dir: Path, check_cmd, propagate=False):
+    def __init__(self, repo: Path, target_dir: Path, check_cmd, propagate=False,
+                 scip=None):
         self.repo = repo
         self.env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir))
         self.check_cmd = check_cmd
@@ -251,6 +363,9 @@ class Session:
         self.reverts = 0
         self.propagate = propagate      # RFC-0003 §3
         self.propagated = 0
+        self.edition = _edition(repo)
+        self.formatted = 0
+        self.scip = scip
 
     # -- helpers
 
@@ -362,6 +477,7 @@ class Session:
         # gate
         self.edits_applied += 1
         self.green.setdefault(str(p), text)     # session starts green
+        was_fmt_clean = self.edition and fmt_clean(p, self.edition)
         p.write_text(text.replace(search, replace, 1))
 
         # RFC-0003 §3. If this edit renamed a definition, the remaining work is
@@ -370,11 +486,16 @@ class Session:
         # milliseconds. Propagation happens before the gate so the whole batch is
         # judged as one change.
         note = ""
-        if self.propagate:
+        if was_fmt_clean and fmt_file(p, self.edition):
+            self.formatted += 1
+            note += " The harness reformatted the file with rustfmt."
+        if self.propagate and self.scip:
             ren = detect_rename(search, replace)
-            if ren and re.search(DEFINES.format(re.escape(ren[0])), search):
-                changed, skipped = propagate_rename(
-                    self.repo, ren[0], ren[1], p,
+            pos = _def_pos(text, search, ren[0]) if ren else None
+            if pos:
+                rel = str(p.relative_to(self.repo.resolve()))
+                changed, skipped, why = propagate_via_scip(
+                    self.repo, self.scip, rel, pos[0], pos[1], ren[0], ren[1],
                     snapshot=lambda q, t: self.green.setdefault(str(q), t))
                 if changed:
                     self.propagated += sum(n for _, n in changed)
@@ -382,8 +503,9 @@ class Session:
                     note = (f"\nThe harness also renamed `{ren[0]}` to `{ren[1]}` at "
                             f"{sum(n for _, n in changed)} reference site(s): {where}.")
                     if skipped:
-                        note += (" Skipped, matched only inside strings or comments: "
-                                 + ", ".join(skipped) + ".")
+                        note += " Skipped: " + ", ".join(skipped) + "."
+                elif why:
+                    note = f"\n(no references propagated: {why})"
         ok, diag, secs = self.run_check()
         self.gate_green = ok
         if ok:
@@ -454,6 +576,18 @@ class Session:
     SIG_FIELDS = {"read": ("path", "start", "end"), "search": ("query",),
                   "edit": ("path", "search", "replace"), "check": (), "finish": ()}
 
+    def would_stall(self, a):
+        """Whether this action would trip the stall rule, without recording it.
+
+        `read` is excluded: a repeated read is *satisfied* by paging forward
+        (§6.3), so it is not a wasted turn and there is nothing to re-roll.
+        """
+        tool = a.get("tool")
+        if tool not in self.SIG_FIELDS or tool == "read":
+            return False
+        sig = (tool,) + tuple(str(a.get(f) or "") for f in self.SIG_FIELDS[tool])
+        return sig in self.recent
+
     def dispatch(self, a):
         tool = a.get("tool")
         if tool not in self.REQUIRED:
@@ -518,7 +652,8 @@ class Session:
 # ------------------------------------------------------------------ the loop
 
 def run_task(task, repo, target_dir, phases, brief, verbose=True, transcript=None,
-             max_turns=MAX_TURNS, reset=True, propagate=False):
+             max_turns=MAX_TURNS, reset=True, propagate=False, resample=False,
+             scip=None):
     # `reset` is False for free-form runs. The suite resets because its fixtures
     # depend on a known starting state; doing that to a repository someone is
     # actually working in would delete their uncommitted work.
@@ -536,7 +671,7 @@ def run_task(task, repo, target_dir, phases, brief, verbose=True, transcript=Non
     # see the whole crate.
     s = s0 = Session(repo, target_dir,
                      task.get("check_cmd", "cargo check --workspace --all-targets"),
-                     propagate=propagate)
+                     propagate=propagate, scip=scip)
     # §5.3: retrieval pre-loads the bodies in the blast radius so the model does
     # not have to spend turns fetching what the harness already knows it needs.
     preload = ""
@@ -569,7 +704,7 @@ def run_task(task, repo, target_dir, phases, brief, verbose=True, transcript=Non
     rec(kind="task", task=task["name"], model=MODEL, prompt=task["prompt"],
         preload_lines=preload.count("\n"), brief=bool(brief))
 
-    wfa_ok = wfa_total = 0
+    wfa_ok = wfa_total = resamples = 0
     t0 = time.time()
     turns = 0
     turn_s = []          # §13's second gate is a *median turn*, so time each one
@@ -586,14 +721,31 @@ def run_task(task, repo, target_dir, phases, brief, verbose=True, transcript=Non
                     print(f"    [{turns}] think: {think[:150]}")
                 msgs.append({"role": "assistant", "content": think})
 
-            wfa_total += 1
-            r = call(msgs, schema=SCHEMA, num_predict=900)
-            raw = (r.get("message") or {}).get("content") or ""
-            try:
-                a = json.loads(raw)
-                wfa_ok += 1
-            except Exception:
-                rec(kind="turn", turn=turns, malformed=raw[:2000])
+            # RFC-0003 §4. A refusal asks the model again under conditions almost
+            # identical to the ones that just produced the bad action, at a
+            # temperature chosen to suppress variety. Re-roll first: the prefix is
+            # unchanged so this is cached prefill plus ~80 output tokens, about
+            # three seconds against a 120s budget.
+            a = None
+            for temp in (RESAMPLE_TEMPS if resample else RESAMPLE_TEMPS[:1]):
+                wfa_total += 1
+                r = call(msgs, schema=SCHEMA, num_predict=900, temperature=temp)
+                raw = (r.get("message") or {}).get("content") or ""
+                try:
+                    cand = json.loads(raw)
+                    wfa_ok += 1
+                except Exception:
+                    rec(kind="turn", turn=turns, malformed=raw[:2000])
+                    a = None
+                    break
+                a = cand
+                if not s.would_stall(cand):
+                    break
+                resamples += 1
+                if verbose:
+                    print(f"    [{turns}] resampling, that would have stalled "
+                          f"(temp {temp} -> next)")
+            if a is None:
                 msgs.append({"role": "user", "content": "That was not valid JSON. Emit one action object."})
                 continue
 
@@ -636,6 +788,7 @@ def run_task(task, repo, target_dir, phases, brief, verbose=True, transcript=Non
         "wfa": (wfa_ok, wfa_total),
         "edit_actions": s.edit_actions, "edits_applied": s.edits_applied,
         "edits_ok_first_apply": s.edits_first_apply_ok, "reverts": s.reverts,
+        "formatted": s.formatted, "resamples": resamples,
         "propagated_sites": s.propagated,
         "final_check_ok": ok, "oracle_ok": oracle_ok,
         "refusals": s.refusals,
@@ -902,7 +1055,7 @@ def free_form(a, repo: Path):
             "preload_text": preload, "preload_paths": used}
     r = run_task(task, overlay, Path(a.target_dir), a.phases, brief,
                  transcript=a.transcript, max_turns=a.max_turns, reset=False,
-                 propagate=a.propagate)
+                 propagate=a.propagate, resample=a.resample, scip=a.scip)
 
     diff = subprocess.run(["git", "diff", "HEAD"], cwd=overlay, capture_output=True,
                           text=True).stdout
@@ -1043,6 +1196,11 @@ def main():
     ap.add_argument("--transcript", default=None, help="append a per-turn JSONL event log here")
     ap.add_argument("-p", "--prompt", default=None,
                     help="free-form mode: one ad-hoc task against a real repo")
+    ap.add_argument("--scip", default=None,
+                    help="path to an index.scip; required by --propagate")
+    ap.add_argument("--resample", action="store_true",
+                    help="RFC-0003 §4: re-roll a turn that would stall, at a higher "
+                         "temperature, before spending the refusal")
     ap.add_argument("--propagate", action="store_true",
                     help="RFC-0003 §3 mechanical propagation. UNSAFE until M1: the "
                          "lexical reference set renamed 84 unrelated sites on dipper")
@@ -1089,7 +1247,7 @@ def main():
             print(f"\n=== {t['name']}{f' (trial {trial})' if a.trials > 1 else ''} ===", flush=True)
             r = run_task(t, repo, Path(a.target_dir), a.phases, brief,
                          transcript=a.transcript, max_turns=a.max_turns,
-                         propagate=a.propagate)
+                         propagate=a.propagate, resample=a.resample, scip=a.scip)
             r["trial"] = trial
             results.append(r)
             print("   ", json.dumps(r), flush=True)
@@ -1108,7 +1266,7 @@ def main():
     med_turn = all_turns[len(all_turns) // 2] if all_turns else 0
     summary = {
         "model": MODEL, "host": HOST, "phases": a.phases, "brief": not a.no_brief,
-        "max_turns": a.max_turns, "propagate": a.propagate,
+        "max_turns": a.max_turns, "propagate": a.propagate, "resample": a.resample,
         "trials": a.trials,
         "repo": str(repo), "repo_rev": subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"], cwd=repo, capture_output=True,
