@@ -7,3 +7,5 @@ repository.workspace   = true
 rust-version.workspace = true
 
 [dependencies]
+protobuf = "3.7"
+scip = "0.9"

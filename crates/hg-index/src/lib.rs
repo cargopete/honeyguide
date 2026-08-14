@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod scip_ingest;
+
 use std::path::PathBuf;
 
 /// `.agent-index/manifest.toml`.

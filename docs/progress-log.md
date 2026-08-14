@@ -2,6 +2,57 @@
 
 Newest first. One entry per meaningful slice of work.
 
+## 2026-08-14 - the turn cap buys nothing, and SCIP settles propagation
+
+RFC-0003's two cheapest items measured, and a lexical shortcut caught before it
+could do damage.
+
+**The turn cap is not the constraint (§6, closed).** Cap 24 against cap 12, three
+trials each: completions 6/15 to 8/15, and the cap did not cause it. Fourteen of
+fifteen runs finished inside the *old* cap; the one that used more turns failed
+anyway; and the `rename` that succeeded took 11 turns, so it was reachable at 12
+all along. Two extra completions against a per-trial spread of 3,1,2 and 2,3,3 is
+noise. Raising the cap costs 33% more wall-clock (949s to 1,260s) for nothing
+demonstrable, so it stays at 12.
+
+Something genuinely new did fall out: `rename` completed **once**, the first
+cascading multi-site edit this project has ever seen finish, in 21 attempts
+across two models. Rare rather than impossible.
+
+**Mechanical propagation, prototyped on grep, is dangerous.** RFC-0003 §3 assumed
+a whole-token search would be a rough version of SCIP. Tried on a copy of dipper,
+renaming `Catalogue::count` rewrote **84 sites across 15 files** —
+`Iterator::count()`, struct fields, local bindings, in crates that do not depend
+on `dipper-index`. No threshold fixes that, and applying an edit to a site that
+merely looks right is fuzzy application, which RFC-0001 §7 forbids by name. It is
+now behind an off-by-default `--propagate` documented as unsafe.
+
+**SCIP gives the exact answer (§3.2b).** `hg-index` now parses a real
+`index.scip`. `rust-analyzer scip` runs in **22.1s** on dipper for 2,815 symbols
+and 28,807 occurrences, and the reference set for `Catalogue::count` is **3
+sites** — the same three the compiler reported as errors when the rename was
+attempted. Two independent oracles, identical answer. The workspace contains six
+distinct symbols named `count`, including `Iterator::count` from `core`, which is
+why the lexical version never stood a chance.
+
+Two bugs surfaced by probing real output instead of reasoning about it: the
+symbol-name parser missed the `impl#[Catalogue]count().` form that inherent
+methods actually take, and a definition lookup keyed on file and line alone is
+non-deterministic, returning the *parameter* declared on the same line as the
+method about a third of the time. Both would have produced confident wrong
+answers.
+
+**Also landed:** free-form mode. `m0/spike.py --repo ~/Projects/dipper -p "..."`
+runs an ad-hoc request against a real repository, working in a `cp -Rc` overlay
+per Q2 and handing back a patch, never touching the working tree, and refusing to
+offer a patch whose gate is red. It builds the project brief structurally from
+`Cargo.toml` (§5.1 pass 3), which on dipper is good enough to be a partial
+explanation for Q4's null result. Retrieval was rebuilt twice: scoring files by
+matched words put a BitTorrent discovery module top for a question about
+`dipper-index`, and the fix was to score *symbols* — a token only counts if it
+has a definition in the tree, and the defining file wins. 8 of 9 realistic
+requests now put the right file in the top two.
+
 ## 2026-08-13 - M0 run in full. The gate was the thing holding the model back
 
 The five-task suite against a real `dipper` checkout, three trials per model,

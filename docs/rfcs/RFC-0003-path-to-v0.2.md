@@ -153,6 +153,46 @@ detection half is unit-tested at 10/10 including the cases §9 asked for, and th
 string and comment masking is exact, so the machinery is ready for a reference
 set that deserves it.
 
+### 3.2b Measured: SCIP gives the reference set exactly
+
+`crates/hg-index/src/scip_ingest.rs` now parses a real `index.scip`.
+`rust-analyzer scip` takes **22.1s** on the M0 target and produces 2.7 MB,
+**2,815 symbols and 28,807 occurrences**. Probed with
+`cargo run -p hg-index --example scip_probe`:
+
+| | lexical (§3.2a) | SCIP |
+|---|---|---|
+| Sites rewritten renaming `Catalogue::count` | **84, in 15 files** | **3** |
+
+The three are `dipper-cli/src/main.rs:518` and lines 364 and 365 of the edited
+crate's own test module. **Those are exactly the three rustc errors** the gate
+reported when the rename was attempted in M0. The reference set and the compiler
+agree site for site, which is the cross-check worth having: two independent
+oracles, same answer.
+
+The index also shows why the lexical version could not have worked. Six distinct
+symbols in this workspace are named `count`: `Catalogue`'s, `SearchQuery`'s two,
+`Bitfield`'s, `Picker`'s, and `Iterator::count` from `core`. A token search sees
+one word. SCIP sees six symbols and is asked about one.
+
+Two bugs surfaced by probing real output rather than reasoning about it, both
+worth recording because both would have produced confident wrong answers:
+
+- rust-analyzer writes an inherent method as `impl#[Catalogue]count().`, with
+  the receiver bracketed. The name parser, written from memory of the schema,
+  returned nothing for that form, so the most common kind of symbol in a Rust
+  codebase was missing from the by-name map entirely.
+- A definition lookup keyed on file and line alone is **non-deterministic**.
+  `pub fn count(&self, query: &str)` defines the method *and* the parameter on
+  one line, and the first version walked a `HashMap` and took whichever it met
+  first. Probed, it returned `local 25` — the parameter — in place of the
+  method. Propagation would have renamed an arbitrary symbol. The lookup now
+  requires a column and prefers a global symbol over a local.
+
+§3 is therefore unblocked in principle: the reference set is exact, the cost is
+one 22-second index per session, and `propagate_rename` needs only to be handed
+SCIP occurrences instead of grep hits.
+
 ### 3.3 Why this is safe
 
 Three defences, and they are the same three the design already relies on.
@@ -297,7 +337,38 @@ An escalated edit is not privileged. It goes through unique-match verification a
 `cargo check` exactly as a local edit does. The strong model is better, not
 trusted.
 
-## 6. Raise the turn cap and measure
+## 6. Raise the turn cap and measure — DONE, and the answer is no
+
+Measured: three trials, driver, cap 24 against the cap-12 baseline.
+
+| | cap 12 | cap 24 |
+|---|---|---|
+| Tasks completed | 6/15 | **8/15** |
+| `rename` | 0/3 | **1/3** |
+| FACP, of edits proposed | 6/24 | 8/33 |
+| Median turn | 8.7s | 8.8s |
+| Total wall | 949s | **1,260s** |
+
+The headline moved and **the cap did not cause it**, which is why §8's kill
+criterion is written against the mechanism rather than the number.
+
+Fourteen of the fifteen runs finished inside the old twelve-turn cap. The one
+run that used more, `add_field` at 21 turns, failed anyway. And the `rename` that
+succeeded took **11 turns**, so it was reachable at cap 12 and simply did not
+happen on those three trials. The extra headroom was used by exactly one task and
+that task failed.
+
+So the two extra completions are trial-to-trial variance, of which there is
+plenty: the driver's per-trial scores are 3, 1, 2 at cap 12 and 2, 3, 3 at cap
+24, on identical inputs. Raising the cap costs 33% more wall-clock (949s to
+1,260s) and buys nothing demonstrable. **The cap stays at 12.**
+
+One genuinely new fact came out of it, and it is not about the cap. `rename`
+completed **once**, which is the first cascading multi-site edit this project has
+ever seen finish, in 21 attempts across two models and two cap settings. It is
+rare rather than impossible, and §3 is about making it reliable.
+
+## 6a. The original argument, kept
 
 The smallest item here, listed because it is nearly free and might quietly be
 part of the answer.
