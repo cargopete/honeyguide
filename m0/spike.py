@@ -1536,6 +1536,14 @@ class AskSession(Session):
         self.idents, self.files = vocab
         self.seen = set()           # paths read, or returned by a search, this session
         self.supplied = set()       # absolute paths retrieval already supplied in full
+        # Paths a carried answer already cited. Measured: told it had not read
+        # `picker.rs` this session, the model re-sent the same citation six times
+        # rather than reading the file, because from where it sits the thread
+        # plainly did read it. Those paths are citable again; every other path
+        # still has to be read. The provenance is printed either way, since a
+        # citation the model is quoting from memory is worth less than one it is
+        # looking at, and the reader should be told which is which.
+        self.carried = set()
         self.answers = 0
         self.result = None          # (text, cites, declined)
 
@@ -1595,9 +1603,29 @@ class AskSession(Session):
             problems.append("`citations` must be `path:line` or `path:start-end`, comma "
                             "separated, or the single word `none` if you cannot answer")
         unseen = sorted({rel for rel, *_ in cites if rel not in self.seen})
-        if unseen:
-            problems.append("you cited " + ", ".join(unseen) + ", which you have not read "
-                            "this session; read it, or cite a file you have")
+        carried_unread = [r for r in unseen if r in self.carried]
+        for rel in (r for r in unseen if r not in self.carried):
+            problems.append(f"you cited {rel}, which you have not read this session; "
+                            "read it, or cite a file you have")
+
+        # A carried path is one an earlier answer in this thread cited, so simply
+        # allowing it was the obvious move and it was wrong. Measured: permitted
+        # to cite `picker.rs` from memory, the model answered that the endgame
+        # returns every unrequested piece, named a `next` method that does not
+        # exist, and cited line 1, the module doc comment. The real behaviour is
+        # that endgame permits a *duplicate* request for a piece already in
+        # flight, which is one filter in `next_for`. It was recalling, not
+        # reading, and recall is exactly what this harness does not accept
+        # anywhere else. So satisfy the precondition instead: hand over the
+        # region it claims to be citing and make it answer from the text.
+        if carried_unread and not problems:
+            rel = carried_unread[0]
+            lo = min(c[1] for c in cites if c[0] == rel)
+            body = self.read(rel, max(1, lo - 40), lo + 80)
+            return (f"Your answer was not accepted: you cited {rel} from an earlier "
+                    "session but have not read it in this one, so it was written from "
+                    "memory rather than from the file. Here is that part of it. Answer "
+                    "again from what it actually says.\n\n" + body)
         bad = ungrounded_terms(text, self.idents, self.files)
         if bad:
             problems.append("these names in your answer do not appear anywhere in this "
@@ -1606,7 +1634,10 @@ class AskSession(Session):
         if problems:
             return self.refuse("ungrounded_answer", "; ".join(problems))
 
-        self.result = (text, cites, False)
+        # Fifth element: whether this citation rests on something read in this
+        # session, or on a file the thread read in an earlier one.
+        self.result = (text, [(rel, lo, hi, lines, rel in self.seen)
+                              for rel, lo, hi, lines in cites], False)
         return None
 
     def act(self, a):
@@ -1619,8 +1650,16 @@ class AskSession(Session):
 
 
 def run_ask(question, repo: Path, brief, preload, preload_paths, max_turns,
-            transcript=None, verbose=True):
-    s = AskSession(repo, repo_vocabulary(repo))
+            transcript=None, verbose=True, carry=(), attached=()):
+    idents, files = repo_vocabulary(repo)
+    # Names the user supplied are not names the model invented, so the grounding
+    # check has to know about them. Without this every identifier in a pasted
+    # snippet reads as a fabrication and the answer is refused for quoting the
+    # question back. The attachment cannot be *cited*, though: citations point at
+    # files on disk, and a paste is not one.
+    for _, text in attached:
+        idents.update(w.lower() for w in WORD.findall(text))
+    s = AskSession(repo, (idents, files))
     # Which of the preloaded files were supplied whole rather than as the regions
     # around a match. Only a whole file can be treated as already read; claiming
     # that for a file supplied in fragments would hide the parts it never saw.
@@ -1634,8 +1673,25 @@ def run_ask(question, repo: Path, brief, preload, preload_paths, max_turns,
                 s.supplied.add(str(f.resolve()))
                 s.read_end[str(f.resolve())] = int(whole[rel])
 
+    # The earlier questions, so a follow-up has a referent, and nothing else.
+    # What those answers *said* is not carried; the files they came from are
+    # supplied as context instead, so the model reads rather than recalls.
+    thread = ""
+    if carry:
+        for e in carry:
+            s.carried.update(e.get("paths", ()))
+        thread = ("\n\nEarlier questions in this thread, so that a follow-up has "
+                  "something to refer back to. The answers are not repeated here; read "
+                  "the files below.\n"
+                  + "\n".join(f"  - {e['question']}" for e in carry))
+    supplied = ""
+    for name, text in attached:
+        supplied += (f"\n\nText supplied with the question, from {name}. This is not part "
+                     "of the repository and cannot be cited; use it to understand what is "
+                     f"being asked.\n---\n{text}\n---")
+
     msgs = [{"role": "system", "content": ASK_SYSTEM + ("\n\n" + brief if brief else "")},
-            {"role": "user", "content": "Question: " + question + preload}]
+            {"role": "user", "content": "Question: " + question + supplied + thread + preload}]
 
     def rec(**kw):
         if transcript:
@@ -1644,6 +1700,8 @@ def run_ask(question, repo: Path, brief, preload, preload_paths, max_turns,
 
     rec(kind="ask", model=MODEL, host=HOST, repo=str(repo), question=question,
         at=time.strftime("%Y-%m-%dT%H:%M:%S"), retrieved=list(preload_paths),
+        carried=[e["question"] for e in carry],
+        attached=[{"from": n, "chars": len(t)} for n, t in attached],
         preload_lines=preload.count("\n"), brief_bytes=len(brief or ""),
         max_turns=max_turns)
 
@@ -1743,7 +1801,7 @@ def run_ask(question, repo: Path, brief, preload, preload_paths, max_turns,
     rec(kind="result", question=question,
         **{k: v for k, v in out.items() if k not in ("result", "last_answer")},
         answer=(s.result[0] if s.result else None),
-        citations=([[rel, lo, hi] for rel, lo, hi, _ in s.result[1]] if s.result else []),
+        citations=([[rel, lo, hi] for rel, lo, hi, *_ in s.result[1]] if s.result else []),
         ungrounded_attempt=(None if s.result else (last_answer or {}).get("answer")))
     # The exact conversation, kept whole. Per-turn records say what happened;
     # tuning a prompt needs what the model was actually looking at when it did.
@@ -1781,22 +1839,132 @@ def file_map(repo: Path, budget=70):
     return "\n".join(out)
 
 
-def ask(a, question, repo: Path):
+ATTACH_CAP = 6000       # characters; §8.5 budgets ~4k tokens for the whole prompt
+
+
+def read_attachment(paths, cap=ATTACH_CAP):
+    """Text supplied with the question rather than found in the repository: a
+    file, or whatever arrives on stdin.
+
+    It exists because the shell is a hostile channel for prose. A pasted error
+    log or code sample carries backticks and `$(...)`, and inside a double-quoted
+    argument zsh executes both before honeyguide sees a character of it. A path,
+    or a pipe, passes the bytes through untouched.
+
+    Truncation is announced rather than silent: a quietly halved attachment looks
+    exactly like a model that ignored half of it."""
+    chunks = []
+    for path in paths or ():
+        f = Path(path)
+        if not f.is_file():
+            print(f"attachment not found, skipping: {path}")
+            continue
+        chunks.append((str(f), f.read_text(errors="replace")))
+    if not sys.stdin.isatty():
+        piped = sys.stdin.read()
+        if piped.strip():
+            chunks.append(("stdin", piped))
+    out = []
+    for name, text in chunks:
+        if len(text) > cap:
+            print(f"attachment {name}: {len(text)} characters, using the first {cap}")
+            text = text[:cap] + "\n... [truncated by the harness]"
+        out.append((name, text))
+    return out
+
+
+def carry_context(repo: Path, sessions=3):
+    """The earlier questions in this repository's thread, and the files their
+    answers came from. Oldest first. For `--continue`.
+
+    The prose of those answers is deliberately **not** carried, and the first
+    version of this got that wrong. Carrying the answer text let the model reply
+    from memory: asked what the endgame changes, it recalled that the picker
+    returns every unrequested piece, named a `next` method that does not exist
+    and cited line 1, the module doc comment. The real behaviour is a duplicate
+    request permitted for a piece already in flight, one filter in `next_for`.
+    Worse, that wrong answer was then carried into the next session and repeated
+    verbatim, so a single bad answer becomes the thread's premise.
+
+    So a follow-up inherits two things: the earlier questions, so that "that" and
+    "it" have a referent, and the paths those answers were grounded in, which are
+    supplied as context so the model reads the code again rather than
+    remembering it. Referents from the thread, facts from the file."""
+    d = Path(os.environ.get("HG_LOG_DIR", Path.home() / ".honeyguide" / "sessions"))
+    if not d.is_dir():
+        return []
+    out = []
+    for f in sorted(d.glob("*.jsonl"), reverse=True):
+        if len(out) >= sessions:
+            break
+        head = res = None
+        for line in f.read_text(errors="replace").splitlines():
+            if line.startswith('{"kind": "messages"'):
+                continue                    # the bulky half, deliberately skipped
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("kind") == "ask":
+                head = r
+            elif r.get("kind") == "result":
+                res = r
+        # Grounded answers only. A decline reads "I have not read any source
+        # files", which is true of the session that produced it and false in the
+        # one it would be carried into, and an ungrounded attempt is a
+        # fabrication the gate has already refused once.
+        if (not head or head.get("repo") != str(repo) or not res
+                or not res.get("answer") or not res.get("grounded")):
+            continue
+        cites = res.get("citations") or []
+        out.append({"question": head.get("question", ""),
+                    "paths": sorted({c[0] for c in cites}), "file": f.name})
+    out.reverse()
+    return out
+
+
+def ask(a, question, repo: Path, attached=()):
     """`--ask "..."`. No overlay: there is no tool in this mode that can write,
     so there is nothing to protect the working tree from, and a whole-tree copy
     of a large repository is a second and a half of nothing."""
     brief = "" if a.no_brief else (Path(a.brief).read_text()
                                    if a.brief and Path(a.brief).is_file()
                                    else degraded_brief(repo))
-    preload, used, _ = retrieve(repo, question, max_files=3, max_lines=600)
+    # Retrieval reads the attachment too: a question of the form "why does this
+    # fail" carries no symbol at all, and every symbol worth looking up is in the
+    # text that came with it.
+    preload, used, _ = retrieve(repo, question + " " + " ".join(t for _, t in attached),
+                                max_files=3, max_lines=600)
     if not used:
         preload = file_map(repo)
         print("retrieval found nothing; supplying the file list instead")
+    carry = carry_context(repo) if a.continue_ else []
+    if a.continue_:
+        if carry:
+            for e in carry:
+                print(f"carrying: {e['question'][:70]}")
+        else:
+            print("nothing to carry: no answered session for this repository yet")
+    # Whatever the thread was grounded in, supply again. A follow-up is usually
+    # about the same file, and paying for it in context is cheaper than the three
+    # turns of paging it otherwise costs.
+    for rel in dict.fromkeys(p for e in carry for p in e["paths"]):
+        f = repo / rel
+        if rel in used or not f.is_file():
+            continue
+        lines = f.read_text(errors="replace").splitlines()
+        if len(lines) > 700:
+            continue                        # too big to hand over whole; let it page
+        preload += (f"\n\n{rel} ({len(lines)} lines, complete):\n"
+                    + "\n".join(f"{i:>4}| {l}" for i, l in enumerate(lines, 1)))
+        used.append(rel)
+        if len(used) >= 4:
+            break
     print("warming model ...", flush=True)
     call([{"role": "user", "content": "ok"}], num_predict=1)
 
     r = run_ask(question, repo, brief, preload, used, a.max_turns,
-                transcript=a.transcript)
+                transcript=a.transcript, carry=carry, attached=attached)
 
     print("\n" + "=" * 66)
     if not r["result"]:
@@ -1820,7 +1988,9 @@ def ask(a, question, repo: Path):
               "outcome and a better one than a guess)")
     if cites:
         print("\ncitations, read back from disk by the harness:")
-        for rel, lo, hi, lines in cites:
+        for rel, lo, hi, lines, fresh in cites:
+            if not fresh:
+                print(f"  ({rel} was not read in this session; carried from an earlier one)")
             for i, line in enumerate(lines, lo):
                 print(f"  {rel}:{i}  {line.strip()[:100]}")
     print("=" * 66)
@@ -2023,6 +2193,14 @@ def main():
                     help="append a per-turn JSONL event log here. Defaults to a new file "
                          "under ~/.honeyguide/sessions, or $HG_LOG_DIR: every run is "
                          "logged whether or not anyone asked for it")
+    ap.add_argument("-f", "--attach", action="append", metavar="PATH",
+                    help="supply a file's text along with the question. Repeatable. "
+                         "Text also arrives on stdin when it is piped, which is the safe "
+                         "way to pass a paste containing backticks or $(...)")
+    ap.add_argument("-c", "--continue", dest="continue_", action="store_true",
+                    help="carry the questions and answers from this repository's recent "
+                         "ask sessions into this one. File contents are not carried: a "
+                         "citation has to be read again to be made again")
     ap.add_argument("--ask", default=None, metavar="QUESTION",
                     help="read-only Q&A: answer a question about the repository. "
                          "No overlay, no edits, no compile gate; answers are checked "
@@ -2062,10 +2240,18 @@ def main():
         print("all oracles fail on a pristine tree" if not bad else f"{bad} oracle(s) useless")
         return 1 if bad else 0
 
-    if a.ask:
+    if a.ask or a.attach or not sys.stdin.isatty():
+        attached = read_attachment(a.attach)
+        question = a.ask or ("Explain the text supplied with this question, in the "
+                             "context of this repository.")
+        if not a.ask and not attached:
+            print("nothing to ask: give a question, a --attach file, or pipe text in")
+            return 2
         print(f"model={MODEL} host={HOST} repo={repo}")
         print(f"transcript: {a.transcript}")
-        return ask(a, a.ask, repo)
+        if not a.ask:
+            print(f"no question given, using: {question}")
+        return ask(a, question, repo, attached)
 
     if a.prompt:
         print(f"model={MODEL} host={HOST} repo={repo}")

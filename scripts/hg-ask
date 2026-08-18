@@ -10,4 +10,20 @@
 # the citations rather than the prose.
 set -eu
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec python3 "$here/../m0/spike.py" --repo "${HG_REPO:-$PWD}" --ask "$*"
+
+# -c carries the previous questions and answers for this repository into the new
+# one, so a follow-up does not have to restate what it is following up on.
+#
+# -f FILE attaches a file's text to the question, and piped stdin does the same.
+# Use one of those for anything containing backticks or $(...): inside a quoted
+# shell argument the shell runs those before honeyguide sees them.
+opts=""
+while :; do
+    case "${1:-}" in
+        -c|--continue)  opts="$opts --continue"; shift ;;
+        -f|--attach)    opts="$opts --attach $2"; shift 2 ;;
+        *)              break ;;
+    esac
+done
+
+exec python3 "$here/../m0/spike.py" --repo "${HG_REPO:-$PWD}" $opts --ask "$*"

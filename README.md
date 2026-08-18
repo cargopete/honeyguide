@@ -108,6 +108,19 @@ It catches invented names, which is the failure this project was founded on. It
 cannot catch a false statement made entirely out of real ones, and it does not
 try. Read the citations.
 
+`-c` continues the thread: the earlier questions in this repository come along
+so that "and what about the endgame?" has something to refer back to, and the
+files those answers were grounded in are supplied again. What is deliberately
+not carried is the text of the earlier answers, because when it was, the model
+answered from memory, got it wrong, and then inherited its own wrong answer as
+the premise of the next question.
+
+`-f FILE` attaches a file to the question, and piped stdin does the same, which
+is the safe way to hand it a paste. Inside a quoted shell argument the shell
+executes backticks and `$(...)` before honeyguide sees them. Attached text
+counts as known names for the grounding check, since the user supplied them, but
+it cannot be cited: citations point at files on disk.
+
 ## Why build it this way
 
 Every general-purpose agent assumes frontier-grade native function calling, and

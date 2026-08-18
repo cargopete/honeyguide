@@ -66,6 +66,39 @@ Retrieval also sent an MSE question into `dipper-web/src/ffmpeg.rs` and
 `play.rs`, on Media Source Extensions, which is §5.3's lexical weakness turning
 up in a new mode and one more argument for the index.
 
+**Later, from using it.** Four defects, all found by asking it real questions
+rather than by reading the code.
+
+`search` only looked at `*.rs`, so `dipper-web` returned no hits: a crate name is
+hyphenated, lives in `Cargo.toml` and never appears as an identifier. It now
+covers `.toml` and `.md`, and a miss reports the paths whose names are close.
+
+Retrieval returned nothing for "explain the UI", because the question contains no
+symbol, and the model was left guessing names in the dark. It now gets the file
+list with line counts when retrieval comes back empty, which is the free stand-in
+for §5.1's ranked repo map. That question went from three and a half minutes and
+a decline to 27 seconds and a correct answer.
+
+The model re-read files retrieval had already supplied whole, five pages of
+twenty seconds on a 498-line file it had been handed complete. A rangeless read
+of a file it already holds is now a page forward.
+
+**And `--continue` taught the sharpest lesson of the day.** Carrying the previous
+answers' *prose* let the model reply from memory: asked what the endgame changes,
+it recalled that the picker returns every unrequested piece, named a `next`
+method that does not exist, and cited line 1, the module doc comment. The real
+behaviour is a duplicate request permitted for a piece already in flight, one
+filter in `next_for`. It then carried that wrong answer into the next session and
+repeated it verbatim, so one bad answer becomes the thread's premise. Carrying
+the *questions* and the *files* instead, and nothing else, produced the correct
+answer with three exact citations. Referents from the thread, facts from the
+file.
+
+`-f` and piped stdin attach text to a question, because the shell executes
+backticks and `$(...)` inside a quoted argument before any of this sees it.
+Attached text joins the vocabulary, or every name in a pasted snippet reads as a
+fabrication, and it cannot be cited.
+
 Timing, warm, `heretic:latest` over Tailscale: median turn 14.7 to 21.6s, whole
 questions 40 to 206s. Four questions whose subject exists were answered and
 grounded, three of them on the forced turn; the one whose subject does not exist
