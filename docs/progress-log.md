@@ -2,6 +2,75 @@
 
 Newest first. One entry per meaningful slice of work.
 
+## 2026-08-18 - ask mode, and the spike had not run since the last commit
+
+**The spike did not run at all.** `--escalate` was plumbed into
+`Session.__init__`, which never used it, while `run_task` reads `escalate_to`
+in its abort branch and did not accept it. Both call sites passed it. Every
+invocation, suite and free-form alike, raised `TypeError` after building the
+overlay and warming cargo, before the first model turn. It landed in 192b5ee
+and nothing has been run end to end since, which is the actual finding: a
+harness whose own runs are the measuring instrument has to be run after it is
+changed, and this one was committed on the strength of the diff.
+
+**Ask mode.** `--ask "question"`, or `scripts/hg-ask` from inside any Rust
+repository. Read-only Q&A: three tools, `read`, `search` and `answer`, no
+overlay because nothing in the mode can write, and no compile gate because an
+answer cannot be compiled. What replaces the gate is a **grounding check**, and
+it is weaker by a long way: the harness builds a vocabulary of every identifier
+in the tree, and refuses an answer that names a file, type, function or constant
+which is not in it. Citations are `path:line`, must resolve to a real line of a
+file the model has actually read this session, and are read back **from disk by
+the harness** for display, so the quoted text is never the model's.
+
+Five questions against two repositories, one trial each, which is an anecdote
+with a denominator and is reported as one.
+
+**The model does not volunteer an answer. It has to be forced to give one.** In
+five runs of five it read a file to exhaustion, stalled, and only answered when
+the harness stopped it. The paging rule handles the re-reads and the stall rule
+aborts, so nothing is wasted beyond the turns, but the answer arrives on the
+forced turn and not before.
+
+**And "stop reading and answer" does not work as a sentence.** Asked in words,
+it searched again. The fix was to narrow the `tool` enum to `["answer"]` for
+that one turn, which is the same lesson as `prompts/README.md`: the decoder
+enforces the enum, and it does not enforce a request. Instructions that must
+hold belong in the schema.
+
+**Asked about a feature the repository does not have, it invents rather than
+declines.** MSE peer encryption, which dipper has no trace of. Forced to answer,
+it produced a `MseCrypto` struct, `dipper-bt/src/crypto.rs`,
+`dipper-bt/src/peer/connection.rs`, a `PEER_KEY` constant and a confident
+citation of the wrong BEP. Told by name which of those do not exist, it invented
+a different set, `MseCodec` over `tokio_util::codec::FramedRead`. The check
+refused both and the mode reported no answer. This is the very first request
+this project ever sent, arriving again in a mode where the compile gate cannot
+follow.
+
+**The first version of the check missed half of it, and the reason is worth
+keeping.** It scanned backticked names, because that is how the prompt asks for
+them. The model wrote `**MseCrypto**` in bold and `PeerConnection::connect()`
+bare, and both passed. Prose is not a format the model has agreed to. The scan
+now reads backticks, bold, CamelCase with a lowercase first hump, and
+SCREAMING_SNAKE, and skips acronyms deliberately: `RC4` and `HTTP` are English
+in a sentence about a protocol, not claims about this repository.
+
+**What it cannot do.** `PeerConnection` is a real type in dipper, so the
+fabricated claim attached to it passed the check untouched. The gate tests
+*names*, not sentences. An answer built entirely from real names can still be
+false, and the citations are there so the reader can check the half the machine
+cannot.
+
+Retrieval also sent an MSE question into `dipper-web/src/ffmpeg.rs` and
+`play.rs`, on Media Source Extensions, which is §5.3's lexical weakness turning
+up in a new mode and one more argument for the index.
+
+Timing, warm, `heretic:latest` over Tailscale: median turn 14.7 to 21.6s, whole
+questions 40 to 206s. Four questions whose subject exists were answered and
+grounded, three of them on the forced turn; the one whose subject does not exist
+was refused twice and reported as unanswered.
+
 ## 2026-08-14 (later) - propagation works, and three trials cannot measure anything
 
 Five configurations of the same five-task suite, three trials each, and the

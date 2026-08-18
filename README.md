@@ -87,6 +87,27 @@ The same script without `-p` runs the ten-task suite, and
 `--selftest` asserts every oracle fails on a pristine tree before any of it is
 believed.
 
+## Asking it questions
+
+```
+scripts/hg-ask "how does the piece picker choose the next piece?"
+python3 m0/spike.py --repo ~/src/dipper --ask "what does Catalogue do?"
+```
+
+Read-only Q&A against whatever repository you are standing in. Three tools,
+`read`, `search` and `answer`; no overlay, because nothing in this mode can
+write; and **no compile gate, because an answer cannot be compiled.** That is
+the whole caveat and it is a large one. What stands in its place is a grounding
+check: the harness builds a vocabulary of every identifier in the tree and
+refuses an answer naming a file, type, function or constant that is not in it,
+and every citation must resolve to a real line of a file the model actually read
+this session. The cited lines printed under an answer are read back from disk by
+the harness, so they are the file rather than the model's recollection of it.
+
+It catches invented names, which is the failure this project was founded on. It
+cannot catch a false statement made entirely out of real ones, and it does not
+try. Read the citations.
+
 ## Why build it this way
 
 Every general-purpose agent assumes frontier-grade native function calling, and
@@ -170,6 +191,18 @@ the index had been built against a tree that then gained two lines and every
 line number past 181 was stale. It verified the text on disk, found it moved,
 and refused rather than renaming two arbitrary five-character spans. That is
 worth more than the run that worked.
+
+**Asked about a feature a repository does not have, the model invents rather
+than declines, and it does not write its inventions in the format you asked
+for.** dipper has no MSE peer encryption. Forced to answer, the model produced a
+`MseCrypto` struct, two file paths, a `PEER_KEY` constant and the wrong BEP
+number; refused and told by name which of those do not exist, it invented a
+different set. The grounding check refused both, but the first version of it
+missed half the first answer, because it scanned backticked names and the model
+had written `**MseCrypto**` in bold and `PeerConnection::connect()` bare. Prose
+is not a format the model has agreed to, so a check that reads only the agreed
+format is checking the wrong text. Note also what survived: `PeerConnection` is
+a real type, and a false claim attached to a real name passes every check here.
 
 **Watch what your success metric counts.** The model emits edits whose `replace`
 is byte-identical to its `search`. The harness applied them, `cargo check` passed
