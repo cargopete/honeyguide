@@ -1718,6 +1718,7 @@ def run_ask(question, repo: Path, brief, preload, preload_paths, max_turns,
     turn_s, turns = [], 0
     last_answer = None
     forced = False
+    refused_in_a_row = 0
     t0 = time.time()
     for turns in range(1, max_turns + 1):
         t_turn = time.time()
@@ -1752,6 +1753,18 @@ def run_ask(question, repo: Path, brief, preload, preload_paths, max_turns,
             if verbose:
                 print(f"          -> {obs.splitlines()[0][:110]}", flush=True)
             msgs.append({"role": "user", "content": obs[:s.OBS_LIMIT]})
+
+            # Two refusals running and the loop is finished, whatever the turn cap
+            # says. Measured: handed `search.rs` whole, the model asked to read it
+            # four times, was refused four times, and cost fifty seconds arriving
+            # at the answer it could have given on turn two. The stall rule needs
+            # three strikes because in edit mode a repeat can still be productive;
+            # here there is nothing left for it to discover.
+            refused_in_a_row = refused_in_a_row + 1 if obs.startswith("REFUSED") else 0
+            if refused_in_a_row >= 2:
+                if verbose:
+                    print("          -> two refusals running; asking for the answer now")
+                break
         finally:
             turn_s.append(round(time.time() - t_turn, 1))
 
@@ -1880,7 +1893,23 @@ def file_map(repo: Path, budget=70):
 ATTACH_CAP = 6000       # characters; §8.5 budgets ~4k tokens for the whole prompt
 
 
-def read_attachment(paths, cap=ATTACH_CAP):
+def read_question(source):
+    """The question itself, from a file or from stdin, for when it cannot survive
+    the shell.
+
+    Measured on a real attempt: a question containing a URL with `&` in it and one
+    stray double quote produced `zsh: parse error near '&'`, and nothing ran. The
+    attachment flags solved that for the *context* and left the question itself
+    going through argv, which is the half more likely to contain a URL."""
+    if source == "-":
+        return sys.stdin.read().strip()
+    f = Path(source)
+    if not f.is_file():
+        return None
+    return f.read_text(errors="replace").strip()
+
+
+def read_attachment(paths, cap=ATTACH_CAP, use_stdin=True):
     """Text supplied with the question rather than found in the repository: a
     file, or whatever arrives on stdin.
 
@@ -1907,7 +1936,7 @@ def read_attachment(paths, cap=ATTACH_CAP):
             missing.append(str(f))
             continue
         chunks.append((str(f), f.read_text(errors="replace")))
-    if not sys.stdin.isatty():
+    if use_stdin and not sys.stdin.isatty():
         piped = sys.stdin.read()
         if piped.strip():
             chunks.append(("stdin", piped))
@@ -1964,6 +1993,8 @@ def carry_context(repo: Path, sessions=3):
                 or not res.get("answer") or not res.get("grounded")):
             continue
         cites = res.get("citations") or []
+        if any(e["question"] == head.get("question", "") for e in out):
+            continue                # asked more than once; the newest one is enough
         out.append({"question": head.get("question", ""),
                     "paths": sorted({c[0] for c in cites}), "file": f.name})
     out.reverse()
@@ -2250,6 +2281,10 @@ def main():
                     help="append a per-turn JSONL event log here. Defaults to a new file "
                          "under ~/.honeyguide/sessions, or $HG_LOG_DIR: every run is "
                          "logged whether or not anyone asked for it")
+    ap.add_argument("-q", "--question-file", dest="question_file", metavar="PATH",
+                    help="read the question from a file, or from stdin with `-`. For a "
+                         "question the shell will not survive: a URL with & in it, or an "
+                         "unbalanced quote, never reaches this program at all")
     ap.add_argument("-f", "--attach", action="append", metavar="PATH",
                     help="supply a file's text along with the question. Repeatable. "
                          "Text also arrives on stdin when it is piped, which is the safe "
@@ -2297,20 +2332,28 @@ def main():
         print("all oracles fail on a pristine tree" if not bad else f"{bad} oracle(s) useless")
         return 1 if bad else 0
 
-    if a.ask or a.attach or not sys.stdin.isatty():
-        attached, missing = read_attachment(a.attach)
+    if a.ask or a.attach or a.question_file or not sys.stdin.isatty():
+        from_stdin = a.question_file == "-"
+        asked = a.ask
+        if a.question_file:
+            asked = read_question(a.question_file)
+            if asked is None:
+                print(f"question file not found: {a.question_file}")
+                return 2
+            print(f"question, from {a.question_file}: {asked[:100]}")
+        attached, missing = read_attachment(a.attach, use_stdin=not from_stdin)
         if missing:
             print("attachment not found: " + ", ".join(missing))
             print("refusing to run: the question was written to be read alongside it")
             return 2
-        question = a.ask or ("Explain the text supplied with this question, in the "
+        question = asked or ("Explain the text supplied with this question, in the "
                              "context of this repository.")
-        if not a.ask and not attached:
+        if not asked and not attached:
             print("nothing to ask: give a question, a --attach file, or pipe text in")
             return 2
         print(f"model={MODEL} host={HOST} repo={repo}")
         print(f"transcript: {a.transcript}")
-        if not a.ask:
+        if not asked:
             print(f"no question given, using: {question}")
         return ask(a, question, repo, attached)
 

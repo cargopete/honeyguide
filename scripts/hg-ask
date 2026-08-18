@@ -5,6 +5,10 @@
 #     hg-ask -c "and what changes in the endgame?"      # continue the thread
 #     hg-ask -f notes.md "does dipper already do this?" # attach a file
 #     pbpaste | hg-ask "which crate would parse that?"  # attach a paste
+#     hg-ask -q question.txt                            # question from a file
+#     hg-ask -q - <<'EOF'                               # question from stdin
+#     anything at all, & quotes " and $(backticks) included
+#     EOF
 #
 # Use -f or a pipe for anything containing backticks or $(...): inside a quoted
 # shell argument the shell runs those before honeyguide sees them.
@@ -24,6 +28,7 @@ while :; do
         --end--)        shift; break ;;
         -c|--continue)  shift; set -- "$@" --continue ;;
         -f|--attach)    file="$2"; shift 2; set -- "$@" --attach "$file" ;;
+        -q|--question-file) qf="$2"; shift 2; set -- "$@" --question-file "$qf" ;;
         *)              q="${q:+$q }$1"; shift ;;
     esac
 done
