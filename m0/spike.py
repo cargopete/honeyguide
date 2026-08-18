@@ -514,6 +514,13 @@ class Session:
     # taking the only other action available, which was to read the file again.
     EXHAUSTED_HINT = "Reading it again will not help; edit it."
     STALL_HINT = ""
+    # Lines served by one `read`, and the hard cap on any observation. A turn
+    # costs about fifteen seconds of latency whatever it carries, so a small page
+    # spends a whole turn to move very little: 120 lines meant eight turns and
+    # 105 seconds to get through an 856-line file. Ask mode raises both, because
+    # it pays for context once and pays for turns over and over.
+    READ_WINDOW = 120
+    OBS_LIMIT = OBS_CAP
 
     # -- helpers
 
@@ -548,11 +555,11 @@ class Session:
                 return self.refuse("read_exhausted",
                                    f"you have already been shown all {len(lines)} lines of "
                                    f"{path}. {self.EXHAUSTED_HINT}")
-        e = min(len(lines), end or min(len(lines), s + 120))
+        e = min(len(lines), end or min(len(lines), s + self.READ_WINDOW))
         self.read_paths.add(str(p))
         self.read_end[str(p)] = max(self.read_end.get(str(p), 0), e)
         body = "\n".join(f"{i:>4}| {lines[i-1]}" for i in range(s, e + 1))
-        return f"read {path} lines {s}-{e} of {len(lines)}\n{body}"[:OBS_CAP]
+        return f"read {path} lines {s}-{e} of {len(lines)}\n{body}"[:self.OBS_LIMIT]
 
     def search(self, query):
         # Stands in for scip.sqlite until hg-index exists. Structural enough for
@@ -1526,6 +1533,8 @@ class AskSession(Session):
     REQUIRED = {"read": ["path"], "search": ["query"], "answer": ["answer"]}
     SIG_FIELDS = {"read": ("path", "start", "end"), "search": ("query",),
                   "answer": ("answer",)}
+    READ_WINDOW = 240
+    OBS_LIMIT = 8000
     EXHAUSTED_HINT = ("Reading it again will not help. Read a different file, "
                       "`search` for a name, or answer from what you have.")
     STALL_HINT = (" If what you have read does not answer the question, say so in "
@@ -1742,7 +1751,7 @@ def run_ask(question, repo: Path, brief, preload, preload_paths, max_turns,
                 break
             if verbose:
                 print(f"          -> {obs.splitlines()[0][:110]}", flush=True)
-            msgs.append({"role": "user", "content": obs[:OBS_CAP]})
+            msgs.append({"role": "user", "content": obs[:s.OBS_LIMIT]})
         finally:
             turn_s.append(round(time.time() - t_turn, 1))
 
@@ -1807,6 +1816,35 @@ def run_ask(question, repo: Path, brief, preload, preload_paths, max_turns,
     # tuning a prompt needs what the model was actually looking at when it did.
     rec(kind="messages", messages=msgs)
     return out
+
+
+OUTLINE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:default\s+)?(?:const\s+)?"
+                     r"(?:async\s+)?(?:unsafe\s+)?(?:extern\s+\S+\s+)?"
+                     r"(fn|struct|enum|trait|impl|mod|type|static)\s")
+
+
+def outline(path: Path, limit=90):
+    """The declarations in a file, with their line numbers.
+
+    For a file too big to supply whole, retrieval gives the regions around the
+    matches and ends them with "use `read` for the rest". Measured, the model
+    took that literally: eight pages and 105 seconds to walk an 856-line
+    `main.rs` from the top. An outline is what it actually needed, and it is
+    §5.3's "symbol signatures" done lexically, sixty lines instead of eight
+    hundred, so the next `read` can be a range rather than a march."""
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    rows = [f"{i:>4}| {l.strip()[:110]}" for i, l in enumerate(lines, 1)
+            if OUTLINE.match(l)]
+    if not rows:
+        return ""
+    head = (f"\nThe declarations in this file, so you can `read` the range you want "
+            f"instead of paging from the top ({len(rows)} of {len(lines)} lines):")
+    if len(rows) > limit:
+        rows = rows[:limit] + [f"  ... {len(rows) - limit} more declarations"]
+    return head + "\n" + "\n".join(rows)
 
 
 def file_map(repo: Path, budget=70):
@@ -1947,6 +1985,16 @@ def ask(a, question, repo: Path, attached=()):
     if not used:
         preload = file_map(repo)
         print("retrieval found nothing; supplying the file list instead")
+    else:
+        # Any file supplied in fragments gets its outline as well, so the model
+        # has somewhere to aim. Files supplied whole need nothing: it has them.
+        whole = set(re.findall(r"^(\S+\.rs) \(\d+ lines, complete\)", preload, re.M))
+        for rel in used:
+            if rel in whole:
+                continue
+            body = outline(repo / rel)
+            if body:
+                preload += f"\n\n{rel}:{body}"
     carry = carry_context(repo) if a.continue_ else []
     if a.continue_:
         if carry:

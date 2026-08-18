@@ -94,6 +94,18 @@ the *questions* and the *files* instead, and nothing else, produced the correct
 answer with three exact citations. Referents from the thread, facts from the
 file.
 
+**The harness told the model to page an 856-line file, and it obeyed.** Retrieval
+budgets 600 lines across three files, so `dipper-cli/src/main.rs` arrived as
+fragments ending in "truncated, use `read` for the rest", and the model read the
+rest: eight pages, eleven turns, 163 seconds. Two changes, and the same question
+now takes two turns and 56 seconds. A file supplied in fragments also gets its
+**outline**, every declaration with its line number, which is 33 lines against
+856 and is §5.3's symbol signatures done lexically. And ask mode's page rose from
+120 lines to 240 with the observation cap at 8000 characters, because a turn
+costs about fifteen seconds of latency whatever it carries: a small page spends a
+whole turn to move very little. That trades §8.5's prompt budget for turns
+deliberately, and the trade is worth measuring properly rather than assuming.
+
 **A missing attachment produced the worst answer of the day, and it passed every
 check.** `-f ~/suggestion.txt "how can we do this in dipper?"`, with no such
 file, warned and carried on, so the model was asked how to do *nothing* and
