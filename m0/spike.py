@@ -45,6 +45,14 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 SYSTEM = (REPO_ROOT / "prompts" / "system.md").read_text()
 SCHEMA = json.loads((REPO_ROOT / "prompts" / "action-schema.json").read_text())
+ASK_SYSTEM = (REPO_ROOT / "prompts" / "ask.md").read_text()
+ASK_SCHEMA = json.loads((REPO_ROOT / "prompts" / "ask-schema.json").read_text())
+# The last turn of an ask session, with the tool enum narrowed to one value.
+# Asked in words to stop reading and answer, the model searched again; the enum
+# is the only instruction Ollama's decoder actually enforces, so the final turn
+# is expressed as a schema rather than as a sentence.
+ASK_FINAL_SCHEMA = json.loads(json.dumps(ASK_SCHEMA))
+ASK_FINAL_SCHEMA["properties"]["tool"]["enum"] = ["answer"]
 
 MAX_TURNS = 12          # RFC-0003 §6: overridable, because one M0 `rename` trial
                         # hit this cap with the error count still falling. That is a
@@ -500,6 +508,13 @@ class Session:
         self.formatted = 0
         self.scip = scip
 
+    # What to tell a model that has read a file to the end, and what to add to a
+    # stall refusal. Both are mode-specific: telling a model to edit something in
+    # a mode with no edit tool is advice it cannot take, and it was observed
+    # taking the only other action available, which was to read the file again.
+    EXHAUSTED_HINT = "Reading it again will not help; edit it."
+    STALL_HINT = ""
+
     # -- helpers
 
     def _abs(self, path):
@@ -532,7 +547,7 @@ class Session:
             if s > len(lines):
                 return self.refuse("read_exhausted",
                                    f"you have already been shown all {len(lines)} lines of "
-                                   f"{path}. Reading it again will not help; edit it.")
+                                   f"{path}. {self.EXHAUSTED_HINT}")
         e = min(len(lines), end or min(len(lines), s + 120))
         self.read_paths.add(str(p))
         self.read_end[str(p)] = max(self.read_end.get(str(p), 0), e)
@@ -544,11 +559,12 @@ class Session:
         # a spike: symbol-ish grep, capped at 20 hits. Falls back to grep because
         # ripgrep is not always a real binary on the PATH.
         if shutil.which("rg"):
-            cmd = ["rg", "-n", "--no-heading", "-m", "20", query, "crates"]
+            cmd = ["rg", "-n", "--no-heading", "-m", "20", "--glob", "*.rs", query, "."]
         else:
-            cmd = ["grep", "-rn", "--include=*.rs", query, "crates"]
+            cmd = ["grep", "-rn", "--include=*.rs", "--exclude-dir=target",
+                   "--exclude-dir=.git", query, "."]
         p = subprocess.run(cmd, cwd=self.repo, capture_output=True, text=True)
-        hits = (p.stdout or "").strip().splitlines()[:20]
+        hits = [h.lstrip("./") for h in (p.stdout or "").strip().splitlines()[:20]]
         if not hits:
             return f"search {query!r}: no hits"
         return f"search {query!r}: {len(hits)} hits\n" + "\n".join(hits)[:OBS_CAP]
@@ -750,7 +766,8 @@ class Session:
                 return self.refuse("stalled_abort", "ABORT")
             return self.refuse("stalled",
                                f"you already did this `{tool}` and got a result above. "
-                               "Do not repeat it; your next action must be different.")
+                               "Do not repeat it; your next action must be different."
+                               + self.STALL_HINT)
         self.stalls = 0
         self.recent.append(sig)
 
@@ -758,6 +775,14 @@ class Session:
             return self.refuse("missing_args",
                                f"`{tool}` needs {', '.join(missing)}; you sent none of them")
 
+        return self.act(a)
+
+    def act(self, a):
+        """The tool-specific half of dispatch. Separate from the preconditions
+        above so that a mode with a different tool surface (`AskSession`) gets
+        the stall rule, the missing-args rule and the paging behaviour without a
+        second copy of any of them."""
+        tool = a.get("tool")
         if tool == "read":
             return self.read(a["path"], a.get("start"), a.get("end"))
         if tool == "search":
@@ -1181,6 +1206,20 @@ def retrieve(repo: Path, task_text: str, max_files=2, max_lines=500, verbose=Tru
     return body, used, idents
 
 
+def session_log_path(kind, repo: Path, text):
+    """Where this run's transcript goes when `--transcript` is not given.
+
+    Every session is logged by default rather than on request. The event log is
+    already the telemetry and the eval corpus (§4.1), and a corpus only exists if
+    it is collected without anyone remembering to ask for it. One file per run,
+    named so the directory can be read without opening anything."""
+    d = Path(os.environ.get("HG_LOG_DIR", Path.home() / ".honeyguide" / "sessions"))
+    d.mkdir(parents=True, exist_ok=True)
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or kind).lower()).strip("-")[:48] or kind
+    model = re.sub(r"[^a-z0-9]+", "-", MODEL.lower()).strip("-")
+    return d / f"{time.strftime('%Y%m%d-%H%M%S')}-{model}-{repo.name}-{kind}-{slug}.jsonl"
+
+
 def make_overlay(repo: Path, dest: Path):
     """Q2, closed: a whole-tree copy-on-write clone where the filesystem supports
     it, a plain copy where it does not. Never a hardlink forest: measured, it
@@ -1257,6 +1296,464 @@ def free_form(a, repo: Path):
     print(f"patch written to {patch}")
     print(f"apply with:  git -C {repo} apply {patch}")
     return 0
+
+
+# ------------------------------------------------------------------ ask mode
+#
+# Read-only Q&A over a repository, and the first thing to say about it is what
+# it does not have. §6.2's compile gate is the mechanism this design leans on,
+# and an answer cannot be compiled. Nothing here can tell a true sentence from a
+# false one.
+#
+# What it can do is check the *names*. The failure this project was founded on
+# was a schema-perfect edit against an entirely invented `src/lib.rs`, and in
+# edit mode that dies against unique-match search. In ask mode the same
+# fabrication arrives as confident prose, so the harness checks every backticked
+# name and every path in the answer against a vocabulary built from the files on
+# disk, and refuses an answer that mentions something which is not there. That
+# is weaker than the compile gate by a long way. It is deterministic, it costs
+# zero model tokens, and it is aimed at the one failure mode actually observed.
+#
+# The mode is read-only at the decoder rather than at dispatch: `prompts/ask-
+# schema.json` has three tools in its `enum` and `edit` is not one of them.
+
+DECLINED = {"none", "n/a", "na", "-", "", "null"}
+
+# Names a Rust answer may legitimately use without them appearing in this
+# repository. Deliberately short: third-party crates do not need to be here
+# because the vocabulary includes every `Cargo.toml`, so a mention of `tokio` in
+# a project that does not depend on tokio *should* be refused.
+STD_NAMES = {
+    "self", "crate", "super", "impl", "struct", "enum", "trait", "match", "async",
+    "await", "unsafe", "static", "const", "type", "where", "return", "break",
+    "continue", "while", "loop", "move", "pub", "mut", "ref", "let", "true",
+    "false", "none", "some", "bool", "char", "usize", "isize", "u128", "i128",
+    "f32", "f64", "vec", "string", "option", "result", "box", "arc", "rc",
+    "refcell", "mutex", "rwlock", "hashmap", "hashset", "btreemap", "btreeset",
+    "vecdeque", "path", "pathbuf", "iterator", "intoiterator", "display",
+    "debug", "clone", "copy", "default", "from", "into", "tryfrom", "tryinto",
+    "send", "sync", "sized", "drop", "deref", "error", "ordering", "cow",
+    "cargo", "rustc", "clippy", "rustfmt", "rust", "toml", "json", "http",
+    "https", "todo", "unwrap", "expect", "main", "test", "tests", "std", "core",
+    "alloc", "dyn", "fn", "mod", "use", "workspace", "readme", "license",
+}
+
+BACKTICKED = re.compile(r"`([^`\n]{1,80})`")
+# Measured, and it was the hole in the first version of this check: asked about a
+# feature that does not exist, the model invented `MseCrypto` and
+# `PeerConnection::connect()` and wrote them in **bold** and bare, not in
+# backticks, so a backtick-only scan passed them both. Prose is not a format the
+# model has agreed to; the check has to read it as it is actually written.
+BOLD = re.compile(r"\*\*([^*\n]{1,80})\*\*")
+# CamelCase with at least one lowercase letter in the first hump, so `RC4`,
+# `HTTP` and `API` are not candidates and `MseCrypto` is. Acronyms are excluded
+# deliberately: they are ordinary English in a sentence about a protocol.
+CAMEL = re.compile(r"\b[A-Z][a-z0-9_]+(?:[A-Z][a-z0-9_]*)+\b")
+SCREAMING = re.compile(r"\b[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+\b")
+FILEISH = re.compile(r"\b[\w./-]+\.(?:rs|toml)\b")
+CITE = re.compile(r"([\w][\w./-]*\.(?:rs|toml))\s*:\s*(\d+)(?:\s*-\s*(\d+))?")
+WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+IDENT_OK = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _source_files(repo: Path, pats=("*.rs", "*.toml")):
+    """Every file the citation checker considers real. `target` is excluded
+    because a build directory contains generated sources, and an answer citing
+    one of those is citing something the user cannot read."""
+    for pat in pats:
+        for f in repo.rglob(pat):
+            parts = f.relative_to(repo).parts
+            if "target" in parts or ".git" in parts:
+                continue
+            yield f
+
+
+def repo_vocabulary(repo: Path):
+    """(identifiers, relative paths). Built once per session by scanning the
+    tree: 14.7k lines takes about a tenth of a second, and it turns every
+    fabrication check into a set membership rather than a grep.
+
+    The identifier half also reads `*.md`, and the citable-file half does not.
+    A name that appears in the README is not one the model invented, even if no
+    Rust file contains it, and refusing "dipper is a BitTorrent client" because
+    `BitTorrent` is not an identifier would be a false refusal on a true
+    sentence. Citations still have to point at code."""
+    idents, files = set(), []
+    for f in _source_files(repo):
+        files.append(str(f.relative_to(repo)))
+    for f in _source_files(repo, ("*.rs", "*.toml", "*.md")):
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        idents.update(w.lower() for w in WORD.findall(text))
+        idents.add(f.stem.lower())
+    return idents, files
+
+
+def _looks_like_code(tok: str) -> bool:
+    """Whether an un-backticked token is claiming to be a name at all.
+
+    Measured, and it refused a correct answer: asked how resume data is saved,
+    the model wrote `**Loading:**` and `**Saving:**` as section headings, and a
+    scan that treats every bold word as a symbol called both of them
+    fabrications. Bold is emphasis in prose and a name in code, and only the
+    second is checkable, so an un-backticked candidate has to look like code
+    before it is held to code's standard. Backticked names keep the old rule,
+    because backticks are the format the prompt asked names to arrive in."""
+    return bool("::" in tok or "(" in tok or "_" in tok
+                or FILEISH.fullmatch(tok) or CAMEL.fullmatch(tok))
+
+
+def _symbol_parts(tok: str):
+    """`Catalogue::count()` -> ['Catalogue', 'count']. Strips the decorations a
+    model puts round a name in prose: call parens, `!` on macros, `?`, borrows,
+    generic arguments, and trailing punctuation."""
+    tok = tok.strip().strip(",.;:")
+    tok = tok.split("<")[0]
+    tok = tok.lstrip("&*")
+    tok = re.sub(r"\(.*$", "", tok).rstrip("!?()")
+    return [p for p in re.split(r"::|\.", tok) if p]
+
+
+def ungrounded_terms(text: str, idents, files):
+    """Names in an answer that do not occur anywhere in the repository.
+
+    Conservative on purpose, because a false refusal costs a turn and a turn is
+    expensive: only single-token backticked names of four characters or more are
+    checked, so `cargo check --workspace` and ordinary English are never
+    candidates. That leaves exactly the shape the observed fabrication took, a
+    confident type or function name that does not exist."""
+    bad = []
+    candidates = [m.group(1).strip() for m in BACKTICKED.finditer(text)]
+    candidates += [t for t in (m.group(1).strip().rstrip(":") for m in BOLD.finditer(text))
+                   if _looks_like_code(t)]
+    candidates += [m.group(0) for m in CAMEL.finditer(text)]
+    candidates += [m.group(0) for m in SCREAMING.finditer(text)]
+    for tok in candidates:
+        if not tok or any(c.isspace() for c in tok):
+            continue                        # a phrase or a command, not a name
+        if FILEISH.fullmatch(tok):
+            continue                        # handled with the other paths below
+        for part in _symbol_parts(tok):
+            if not IDENT_OK.match(part) or len(part) < 4:
+                continue
+            if part.lower() in STD_NAMES or part.lower() in idents:
+                continue
+            bad.append(part)
+    for m in FILEISH.finditer(text):
+        rel = m.group(0).lstrip("./")
+        if not any(f == rel or f.endswith("/" + rel) for f in files):
+            bad.append(rel)
+    return sorted(dict.fromkeys(bad))
+
+
+def resolve_cited_path(cand: str, files):
+    """A citation's path, resolved against the tree. Accepts a bare file name
+    when it is unambiguous, because insisting on the full path costs a turn to
+    say so and the harness can tell whether it is ambiguous."""
+    cand = cand.lstrip("./")
+    exact = [f for f in files if f == cand]
+    if exact:
+        return exact[0], None
+    tail = [f for f in files if f.endswith("/" + cand)]
+    if len(tail) == 1:
+        return tail[0], None
+    if len(tail) > 1:
+        return None, f"{cand} matches {len(tail)} files; give the path from the repository root"
+    return None, f"there is no {cand} in this repository"
+
+
+def parse_citations(repo: Path, raw: str, files):
+    """(cites, problems). Each cite is (rel, lo, hi, [lines]), and the lines are
+    read from disk by the harness rather than taken from the model: the point of
+    a citation is that the user can check the claim against the file, so the
+    quoted text has to come from the file."""
+    cites, problems = [], []
+    for m in CITE.finditer(raw or ""):
+        rel, why = resolve_cited_path(m.group(1), files)
+        if why:
+            problems.append(why)
+            continue
+        lines = (repo / rel).read_text(errors="replace").splitlines()
+        lo = int(m.group(2))
+        hi = int(m.group(3)) if m.group(3) else lo
+        if lo > len(lines):
+            problems.append(f"{rel} has {len(lines)} lines, so {rel}:{lo} does not exist")
+            continue
+        hi = max(lo, min(hi, len(lines), lo + 5))
+        cites.append((rel, lo, hi, lines[lo - 1:hi]))
+    return cites, problems
+
+
+class AskSession(Session):
+    """One question against one repository, read-only.
+
+    Inherits `read`, `search`, the stall rule and the paging behaviour from
+    `Session` and adds no way to write anything. The gate command it is given
+    would fail loudly if some later edit to this file ever called it."""
+
+    REQUIRED = {"read": ["path"], "search": ["query"], "answer": ["answer"]}
+    SIG_FIELDS = {"read": ("path", "start", "end"), "search": ("query",),
+                  "answer": ("answer",)}
+    EXHAUSTED_HINT = ("Reading it again will not help. Read a different file, "
+                      "`search` for a name, or answer from what you have.")
+    STALL_HINT = (" If what you have read does not answer the question, say so in "
+                  "`answer` and set `citations` to `none`.")
+
+    def __init__(self, repo: Path, vocab):
+        super().__init__(repo, Path("/nonexistent"), "false")
+        self.idents, self.files = vocab
+        self.seen = set()           # paths read, or returned by a search, this session
+        self.answers = 0
+        self.result = None          # (text, cites, declined)
+
+    def _rel(self, path):
+        p = self._abs(path)
+        if p is None or not p.is_file():
+            return None
+        try:
+            return str(p.relative_to(self.repo.resolve()))
+        except ValueError:
+            return None
+
+    def read(self, path, start=None, end=None, advance=False):
+        obs = super().read(path, start, end, advance)
+        rel = self._rel(path)
+        if rel and not obs.startswith("REFUSED"):
+            self.seen.add(rel)
+        return obs
+
+    def search(self, query):
+        obs = super().search(query)
+        for line in obs.splitlines()[1:]:
+            rel = line.split(":", 1)[0]
+            # A grep hit shows the matching line, so the model has seen enough of
+            # that file to cite the line it was shown, and only that line.
+            if rel.endswith(".rs"):
+                self.seen.add(rel)
+        return obs
+
+    def answer(self, text, citations):
+        """The grounding gate. Returns None to end the session, or a refusal."""
+        self.answers += 1
+        text = (text or "").strip()
+        if not text:
+            return self.refuse("empty_answer", "`answer` was empty; say what you found.")
+
+        declined = (citations or "").strip().lower() in DECLINED
+        if declined:
+            # A declared non-answer asserts nothing about the repository, so
+            # there is nothing to check and nothing to refuse. Refusing one would
+            # only teach the model to guess instead, which is the trade this
+            # whole mode exists to avoid.
+            self.result = (text, [], True)
+            return None
+
+        cites, problems = parse_citations(self.repo, citations, self.files)
+        if not cites and not problems:
+            problems.append("`citations` must be `path:line` or `path:start-end`, comma "
+                            "separated, or the single word `none` if you cannot answer")
+        unseen = sorted({rel for rel, *_ in cites if rel not in self.seen})
+        if unseen:
+            problems.append("you cited " + ", ".join(unseen) + ", which you have not read "
+                            "this session; read it, or cite a file you have")
+        bad = ungrounded_terms(text, self.idents, self.files)
+        if bad:
+            problems.append("these names in your answer do not appear anywhere in this "
+                            "repository: " + ", ".join(bad) + "; they were not read, they "
+                            "were invented, so remove them and answer from what you read")
+        if problems:
+            return self.refuse("ungrounded_answer", "; ".join(problems))
+
+        self.result = (text, cites, False)
+        return None
+
+    def act(self, a):
+        tool = a.get("tool")
+        if tool == "read":
+            return self.read(a["path"], a.get("start"), a.get("end"))
+        if tool == "search":
+            return self.search(a["query"])
+        return self.answer(a.get("answer", ""), a.get("citations", ""))
+
+
+def run_ask(question, repo: Path, brief, preload, preload_paths, max_turns,
+            transcript=None, verbose=True):
+    s = AskSession(repo, repo_vocabulary(repo))
+    for rel in preload_paths:
+        f = (repo / rel)
+        if f.is_file():
+            s.read_paths.add(str(f.resolve()))
+            s.seen.add(rel)
+
+    msgs = [{"role": "system", "content": ASK_SYSTEM + ("\n\n" + brief if brief else "")},
+            {"role": "user", "content": "Question: " + question + preload}]
+
+    def rec(**kw):
+        if transcript:
+            with open(transcript, "a") as fh:
+                fh.write(json.dumps(kw) + "\n")
+
+    rec(kind="ask", model=MODEL, host=HOST, repo=str(repo), question=question,
+        at=time.strftime("%Y-%m-%dT%H:%M:%S"), retrieved=list(preload_paths),
+        preload_lines=preload.count("\n"), brief_bytes=len(brief or ""),
+        max_turns=max_turns)
+
+    wfa_ok = wfa_total = 0
+    turn_s, turns = [], 0
+    last_answer = None
+    forced = False
+    t0 = time.time()
+    for turns in range(1, max_turns + 1):
+        t_turn = time.time()
+        try:
+            wfa_total += 1
+            r = call(msgs, schema=ASK_SCHEMA, num_predict=900)
+            raw = (r.get("message") or {}).get("content") or ""
+            try:
+                a = json.loads(raw)
+                wfa_ok += 1
+            except Exception:
+                rec(kind="turn", turn=turns, malformed=raw[:2000])
+                msgs.append({"role": "user",
+                             "content": "That was not valid JSON. Emit one action object."})
+                continue
+
+            msgs.append({"role": "assistant", "content": raw})
+            if verbose:
+                shown = {"read": "path", "search": "query"}.get(a.get("tool"), "")
+                print(f"    [{turns}] {a.get('tool')} "
+                      f"{a.get(shown) if shown else ''}"[:110], flush=True)
+            if a.get("tool") == "answer":
+                last_answer = a
+            obs = s.dispatch(a)
+            rec(kind="turn", turn=turns, action=a, obs=obs)
+            if obs is None:
+                break
+            if obs.endswith("ABORT"):
+                if verbose:
+                    print("          -> stalled three times on the same action")
+                break
+            if verbose:
+                print(f"          -> {obs.splitlines()[0][:110]}", flush=True)
+            msgs.append({"role": "user", "content": obs[:OBS_CAP]})
+        finally:
+            turn_s.append(round(time.time() - t_turn, 1))
+
+    # The loop ending is a fact about the loop, not about what the model knows.
+    # A model that has read four hundred lines and then run out of turns is one
+    # question away from being able to say so, and that question costs one turn.
+    if not s.result and turns:
+        if verbose:
+            print("    [forced] out of turns; asking for an answer from what was read",
+                  flush=True)
+        s.recent.clear()
+        s.stalls = 0
+        msgs.append({"role": "user", "content":
+                     "Stop reading. Answer the question now from what you have already "
+                     "been shown this session. If it is not enough, say exactly that in "
+                     "`answer` and set `citations` to `none`."})
+        # Two attempts, not one. Measured: forced to answer a question about a
+        # feature the repository does not have, the model invented a struct, two
+        # files and a constant. The grounding check refused all four by name, and
+        # a model told exactly which names do not exist is in a position to say
+        # the thing it should have said first. A third attempt is not offered:
+        # past two this is no longer a model that needs telling.
+        for attempt in (1, 2):
+            wfa_total += 1
+            t_turn = time.time()
+            r = call(msgs, schema=ASK_FINAL_SCHEMA, num_predict=900)
+            turn_s.append(round(time.time() - t_turn, 1))
+            raw = (r.get("message") or {}).get("content") or ""
+            try:
+                a = json.loads(raw)
+            except json.JSONDecodeError:
+                rec(kind="turn", turn=turns + attempt, forced=True, malformed=raw[:2000])
+                break
+            wfa_ok += 1
+            forced = True
+            last_answer = a
+            obs = s.dispatch(a)
+            rec(kind="turn", turn=turns + attempt, forced=True, action=a, obs=obs)
+            if verbose:
+                print(f"          -> {(obs or 'answered').splitlines()[0][:110]}", flush=True)
+            if obs is None:
+                break
+            msgs.append({"role": "assistant", "content": raw})
+            msgs.append({"role": "user", "content": obs[:OBS_CAP]})
+            s.recent.clear()
+            s.stalls = 0
+
+    out = {
+        "turns": turns, "wall_s": round(time.time() - t0, 1), "turn_s": turn_s,
+        "median_turn_s": sorted(turn_s)[len(turn_s) // 2] if turn_s else None,
+        "wfa": (wfa_ok, wfa_total), "answers": s.answers, "forced": forced,
+        "grounded": bool(s.result and not s.result[2]),
+        "declined": bool(s.result and s.result[2]),
+        "result": s.result, "last_answer": last_answer, "refusals": s.refusals,
+    }
+    rec(kind="result", question=question,
+        **{k: v for k, v in out.items() if k not in ("result", "last_answer")},
+        answer=(s.result[0] if s.result else None),
+        citations=([[rel, lo, hi] for rel, lo, hi, _ in s.result[1]] if s.result else []),
+        ungrounded_attempt=(None if s.result else (last_answer or {}).get("answer")))
+    # The exact conversation, kept whole. Per-turn records say what happened;
+    # tuning a prompt needs what the model was actually looking at when it did.
+    rec(kind="messages", messages=msgs)
+    return out
+
+
+def ask(a, question, repo: Path):
+    """`--ask "..."`. No overlay: there is no tool in this mode that can write,
+    so there is nothing to protect the working tree from, and a whole-tree copy
+    of a large repository is a second and a half of nothing."""
+    brief = "" if a.no_brief else (Path(a.brief).read_text()
+                                   if a.brief and Path(a.brief).is_file()
+                                   else degraded_brief(repo))
+    preload, used, _ = retrieve(repo, question, max_files=3, max_lines=600)
+    if not used:
+        print("retrieval found nothing; the model will have to `search` for itself")
+    print("warming model ...", flush=True)
+    call([{"role": "user", "content": "ok"}], num_predict=1)
+
+    r = run_ask(question, repo, brief, preload, used, a.max_turns,
+                transcript=a.transcript)
+
+    print("\n" + "=" * 66)
+    if not r["result"]:
+        print(f"no answer in {r['turns']} turns.")
+        if r["refusals"]:
+            print("refusals:", ", ".join(r["refusals"]))
+        if r["last_answer"]:
+            # Printed, but never as though it had passed. The last attempt is
+            # usually informative about *why* it failed, and hiding it would make
+            # the mode harder to debug than it needs to be.
+            print("\nthe last answer attempt, WHICH FAILED THE GROUNDING CHECK "
+                  "and should not be trusted:\n")
+            print(r["last_answer"].get("answer", "")[:1500])
+        print("=" * 66)
+        return 1
+
+    text, cites, declined = r["result"]
+    print(text)
+    if declined:
+        print("\n(the model declined to answer from what it read, which is a permitted "
+              "outcome and a better one than a guess)")
+    if cites:
+        print("\ncitations, read back from disk by the harness:")
+        for rel, lo, hi, lines in cites:
+            for i, line in enumerate(lines, lo):
+                print(f"  {rel}:{i}  {line.strip()[:100]}")
+    print("=" * 66)
+    print(f"turns {r['turns']}   wall {r['wall_s']}s   median turn {r['median_turn_s']}s"
+          f"   answers {r['answers']}")
+    if r["refusals"]:
+        print("refusals:", ", ".join(r["refusals"]))
+    print("checked: every cited path exists and was read this session, every cited line "
+          "exists, and every name in the answer occurs in the repository.")
+    print("NOT checked: whether the answer is true. There is no compile gate on prose.")
+    return 0 if not declined else 1
 
 
 # -------------------------------------------------------------------- tasks
@@ -1444,7 +1941,14 @@ def main():
     ap.add_argument("--no-brief", action="store_true",
                     help="run without the project brief, for the index-value A/B")
     ap.add_argument("--out", default=None, help="write the result JSON here")
-    ap.add_argument("--transcript", default=None, help="append a per-turn JSONL event log here")
+    ap.add_argument("--transcript", default=None,
+                    help="append a per-turn JSONL event log here. Defaults to a new file "
+                         "under ~/.honeyguide/sessions, or $HG_LOG_DIR: every run is "
+                         "logged whether or not anyone asked for it")
+    ap.add_argument("--ask", default=None, metavar="QUESTION",
+                    help="read-only Q&A: answer a question about the repository. "
+                         "No overlay, no edits, no compile gate; answers are checked "
+                         "against the names and lines that exist on disk")
     ap.add_argument("-p", "--prompt", default=None,
                     help="free-form mode: one ad-hoc task against a real repo")
     ap.add_argument("--escalate", nargs="?", const=ESCALATE_MODEL, default=None,
@@ -1470,14 +1974,24 @@ def main():
     a = ap.parse_args()
 
     repo = Path(a.repo).resolve()
+    if not a.transcript and not a.selftest:
+        kind = "ask" if a.ask else ("edit" if a.prompt else "suite")
+        a.transcript = str(session_log_path(kind, repo, a.ask or a.prompt))
+
     if a.selftest:
         print(f"oracle self-test against {repo}")
         bad = selftest(repo, Path(a.target_dir))
         print("all oracles fail on a pristine tree" if not bad else f"{bad} oracle(s) useless")
         return 1 if bad else 0
 
+    if a.ask:
+        print(f"model={MODEL} host={HOST} repo={repo}")
+        print(f"transcript: {a.transcript}")
+        return ask(a, a.ask, repo)
+
     if a.prompt:
         print(f"model={MODEL} host={HOST} repo={repo}")
+        print(f"transcript: {a.transcript}")
         return free_form(a, repo)
 
     suite_brief = Path(a.brief) if a.brief else HERE / "dipper-brief.md"

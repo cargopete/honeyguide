@@ -1,0 +1,13 @@
+#!/bin/sh
+# Ask a question about the repository you are standing in.
+#
+#     scripts/hg-ask "what does the piece picker do?"
+#     HG_REPO=~/src/dipper scripts/hg-ask "how do you write to the index?"
+#
+# Read-only: this mode has no edit tool and no way to write a file, so it is
+# safe to run against a tree with uncommitted work in it. There is no compile
+# gate on an answer, only the grounding check described in RFC-0001 §5, so read
+# the citations rather than the prose.
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 "$here/../m0/spike.py" --repo "${HG_REPO:-$PWD}" --ask "$*"

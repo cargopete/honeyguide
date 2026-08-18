@@ -1,0 +1,43 @@
+{
+  "$comment": "The action object for one turn of ask mode (read-only Q&A). Flat and every string bounded, for the reasons in prompts/README.md, and `required` again lists every string field because Ollama enforces the top-level list and nothing else useful. The important line is the `tool` enum: it is three values, and `edit` is not one of them. Read-only is enforced at the decoder rather than at dispatch, so the model cannot emit a write action even malformed.",
+  "type": "object",
+  "properties": {
+    "reasoning": {
+      "type": "string",
+      "maxLength": 400,
+      "$comment": "Two sentences. Bounded because latency is output length."
+    },
+    "tool": {
+      "type": "string",
+      "enum": ["read", "search", "answer"]
+    },
+    "path": {
+      "type": "string",
+      "maxLength": 200
+    },
+    "start": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "end": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "query": {
+      "type": "string",
+      "maxLength": 120
+    },
+    "answer": {
+      "type": "string",
+      "maxLength": 1500,
+      "$comment": "About 375 tokens, which at 25.3 tok/s decode is fifteen seconds of answer. Longer answers are not better ones and this is the single most expensive field in the mode."
+    },
+    "citations": {
+      "type": "string",
+      "maxLength": 300,
+      "$comment": "`path:line` or `path:start-end`, comma separated, or the literal `none` when the model is declining to answer. A string rather than an array of objects: nesting is what produced empty actions when it was tried on the edit schema, and the harness can parse commas."
+    }
+  },
+  "required": ["reasoning", "tool", "path", "query", "answer", "citations"],
+  "additionalProperties": false
+}
