@@ -558,16 +558,46 @@ class Session:
         # Stands in for scip.sqlite until hg-index exists. Structural enough for
         # a spike: symbol-ish grep, capped at 20 hits. Falls back to grep because
         # ripgrep is not always a real binary on the PATH.
+        # `*.toml` and `*.md` as well as `*.rs`. Measured: asked about the web
+        # UI, the model searched for `dipper-web`, which is a directory name and
+        # a Cargo.toml key and never an identifier in a Rust file, so an honest
+        # `no hits` sent it nowhere. Crate names are hyphenated and code is not.
+        globs = ("*.rs", "*.toml", "*.md")
         if shutil.which("rg"):
-            cmd = ["rg", "-n", "--no-heading", "-m", "20", "--glob", "*.rs", query, "."]
+            cmd = ["rg", "-n", "--no-heading", "-m", "20"]
+            for g in globs:
+                cmd += ["--glob", g]
+            cmd += [query, "."]
         else:
-            cmd = ["grep", "-rn", "--include=*.rs", "--exclude-dir=target",
-                   "--exclude-dir=.git", query, "."]
+            cmd = ["grep", "-rn"] + [f"--include={g}" for g in globs] + \
+                  ["--exclude-dir=target", "--exclude-dir=.git", query, "."]
         p = subprocess.run(cmd, cwd=self.repo, capture_output=True, text=True)
         hits = [h.lstrip("./") for h in (p.stdout or "").strip().splitlines()[:20]]
         if not hits:
-            return f"search {query!r}: no hits"
+            # A search that fails should say what it can see. The alternative is
+            # a model with a plausible name, no hits, and no next move, which is
+            # exactly the stall this harness exists to remove.
+            near = self.near_names(query)
+            return (f"search {query!r}: no hits"
+                    + (f". Paths whose name is close: {near}" if near else ""))
         return f"search {query!r}: {len(hits)} hits\n" + "\n".join(hits)[:OBS_CAP]
+
+    def near_names(self, query, limit=8):
+        """Files and directories whose name resembles the query, hyphens and
+        underscores ignored. `dipper-web` finds `crates/dipper-web/`, which is
+        the answer the model was actually looking for."""
+        key = re.sub(r"[^a-z0-9]", "", query.lower())
+        if len(key) < 4:
+            return ""
+        out = []
+        for root, dirs, files in os.walk(self.repo):
+            dirs[:] = [d for d in dirs if d not in ("target", ".git", "node_modules")]
+            for name in dirs + files:
+                flat = re.sub(r"[^a-z0-9]", "", Path(name).stem.lower())
+                if flat and (key in flat or flat in key):
+                    rel = str((Path(root) / name).relative_to(self.repo))
+                    out.append(rel + ("/" if name in dirs else ""))
+        return ", ".join(sorted(set(out), key=len)[:limit])
 
     def edit(self, path, search, replace):
         self.edit_actions += 1
@@ -1505,6 +1535,7 @@ class AskSession(Session):
         super().__init__(repo, Path("/nonexistent"), "false")
         self.idents, self.files = vocab
         self.seen = set()           # paths read, or returned by a search, this session
+        self.supplied = set()       # absolute paths retrieval already supplied in full
         self.answers = 0
         self.result = None          # (text, cites, declined)
 
@@ -1518,6 +1549,15 @@ class AskSession(Session):
             return None
 
     def read(self, path, start=None, end=None, advance=False):
+        # Measured: asked about the piece picker, retrieval supplied all 498
+        # lines of `picker.rs` and the model then read it from line 1 in five
+        # pages of twenty seconds each, learning nothing it had not been given.
+        # A rangeless read of a file it already holds in full is treated as a
+        # page forward, which is what the stall rule does four turns later
+        # anyway, and it arrives at the same place having spent nothing.
+        p = self._abs(path)
+        if p is not None and str(p) in self.supplied and not start and not end:
+            advance = True
         obs = super().read(path, start, end, advance)
         rel = self._rel(path)
         if rel and not obs.startswith("REFUSED"):
@@ -1581,11 +1621,18 @@ class AskSession(Session):
 def run_ask(question, repo: Path, brief, preload, preload_paths, max_turns,
             transcript=None, verbose=True):
     s = AskSession(repo, repo_vocabulary(repo))
+    # Which of the preloaded files were supplied whole rather than as the regions
+    # around a match. Only a whole file can be treated as already read; claiming
+    # that for a file supplied in fragments would hide the parts it never saw.
+    whole = dict(re.findall(r"^(\S+\.rs) \((\d+) lines, complete\)", preload, re.M))
     for rel in preload_paths:
         f = (repo / rel)
         if f.is_file():
             s.read_paths.add(str(f.resolve()))
             s.seen.add(rel)
+            if rel in whole:
+                s.supplied.add(str(f.resolve()))
+                s.read_end[str(f.resolve())] = int(whole[rel])
 
     msgs = [{"role": "system", "content": ASK_SYSTEM + ("\n\n" + brief if brief else "")},
             {"role": "user", "content": "Question: " + question + preload}]
@@ -1704,6 +1751,36 @@ def run_ask(question, repo: Path, brief, preload, preload_paths, max_turns,
     return out
 
 
+def file_map(repo: Path, budget=70):
+    """A listing of the Rust files and their sizes, for when retrieval finds
+    nothing at all.
+
+    §5.1's `repomap.txt` is the real answer to this and it is PageRank-ranked and
+    budgeted. This is the version that costs nothing and needs no index: a
+    question like "explain the UI" contains no symbol, retrieval returns empty,
+    and the model starts with no idea which files exist. It then guesses a name,
+    finds nothing, and stalls. A plain list of what is there is not clever, but
+    it is the difference between searching and guessing."""
+    rows = []
+    for f in _source_files(repo, ("*.rs",)):
+        try:
+            n = len(f.read_text(errors="replace").splitlines())
+        except OSError:
+            continue
+        rows.append((str(f.relative_to(repo)), n))
+    if not rows:
+        return ""
+    rows.sort(key=lambda r: -r[1])
+    shown = rows[:budget]
+    out = ["\n\nRetrieval matched nothing in your question, so here is every Rust file "
+           f"in the repository instead, largest first ({len(rows)} files). Nothing has "
+           "been read yet: use `read` on whichever of these looks right."]
+    out += [f"  {rel} ({n} lines)" for rel, n in shown]
+    if len(rows) > budget:
+        out.append(f"  ... and {len(rows) - budget} smaller files")
+    return "\n".join(out)
+
+
 def ask(a, question, repo: Path):
     """`--ask "..."`. No overlay: there is no tool in this mode that can write,
     so there is nothing to protect the working tree from, and a whole-tree copy
@@ -1713,7 +1790,8 @@ def ask(a, question, repo: Path):
                                    else degraded_brief(repo))
     preload, used, _ = retrieve(repo, question, max_files=3, max_lines=600)
     if not used:
-        print("retrieval found nothing; the model will have to `search` for itself")
+        preload = file_map(repo)
+        print("retrieval found nothing; supplying the file list instead")
     print("warming model ...", flush=True)
     call([{"role": "user", "content": "ok"}], num_predict=1)
 
