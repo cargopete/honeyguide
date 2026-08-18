@@ -468,7 +468,7 @@ class Session:
     """One task attempt against one overlay."""
 
     def __init__(self, repo: Path, target_dir: Path, check_cmd, propagate=False,
-                 scip=None, escalate_to=None):
+                 scip=None):
         self.repo = repo
         self.env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir))
         self.check_cmd = check_cmd
@@ -786,7 +786,7 @@ class Session:
 
 def run_task(task, repo, target_dir, phases, brief, verbose=True, transcript=None,
              max_turns=MAX_TURNS, reset=True, propagate=False, resample=False,
-             scip=None):
+             scip=None, escalate_to=None):
     # `reset` is False for free-form runs. The suite resets because its fixtures
     # depend on a known starting state; doing that to a repository someone is
     # actually working in would delete their uncommitted work.
