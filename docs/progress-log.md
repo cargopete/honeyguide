@@ -94,6 +94,15 @@ the *questions* and the *files* instead, and nothing else, produced the correct
 answer with three exact citations. Referents from the thread, facts from the
 file.
 
+**A missing attachment produced the worst answer of the day, and it passed every
+check.** `-f ~/suggestion.txt "how can we do this in dipper?"`, with no such
+file, warned and carried on, so the model was asked how to do *nothing* and
+returned a fluent paragraph about dipper downloading torrents, correctly cited to
+a doc comment. Grounded, well-formed, worthless. Every mechanism here tests the
+answer, and the fault was in the question. A named file that is not there is now
+fatal before the first model call. The general lesson is the one the gate cannot
+fix by itself: it checks that names exist, not that a question had content.
+
 `-f` and piped stdin attach text to a question, because the shell executes
 backticks and `$(...)` inside a quoted argument before any of this sees it.
 Attached text joins the vocabulary, or every name in a pasted snippet reads as a

@@ -1,29 +1,31 @@
 #!/bin/sh
 # Ask a question about the repository you are standing in.
 #
-#     scripts/hg-ask "what does the piece picker do?"
-#     HG_REPO=~/src/dipper scripts/hg-ask "how do you write to the index?"
+#     hg-ask "what does the piece picker do?"
+#     hg-ask -c "and what changes in the endgame?"      # continue the thread
+#     hg-ask -f notes.md "does dipper already do this?" # attach a file
+#     pbpaste | hg-ask "which crate would parse that?"  # attach a paste
+#
+# Use -f or a pipe for anything containing backticks or $(...): inside a quoted
+# shell argument the shell runs those before honeyguide sees them.
 #
 # Read-only: this mode has no edit tool and no way to write a file, so it is
 # safe to run against a tree with uncommitted work in it. There is no compile
-# gate on an answer, only the grounding check described in RFC-0001 §5, so read
-# the citations rather than the prose.
+# gate on an answer, only the grounding check, so read the citations.
 set -eu
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-# -c carries the previous questions and answers for this repository into the new
-# one, so a follow-up does not have to restate what it is following up on.
-#
-# -f FILE attaches a file's text to the question, and piped stdin does the same.
-# Use one of those for anything containing backticks or $(...): inside a quoted
-# shell argument the shell runs those before honeyguide sees them.
-opts=""
+# Flags are rotated to the end of the positional list and the rest is collected
+# as the question, so a path with a space in it survives the trip.
+set -- "$@" --end--
+q=""
 while :; do
     case "${1:-}" in
-        -c|--continue)  opts="$opts --continue"; shift ;;
-        -f|--attach)    opts="$opts --attach $2"; shift 2 ;;
-        *)              break ;;
+        --end--)        shift; break ;;
+        -c|--continue)  shift; set -- "$@" --continue ;;
+        -f|--attach)    file="$2"; shift 2; set -- "$@" --attach "$file" ;;
+        *)              q="${q:+$q }$1"; shift ;;
     esac
 done
 
-exec python3 "$here/../m0/spike.py" --repo "${HG_REPO:-$PWD}" $opts --ask "$*"
+exec python3 "$here/../m0/spike.py" --repo "${HG_REPO:-$PWD}" "$@" --ask "$q"

@@ -1852,12 +1852,21 @@ def read_attachment(paths, cap=ATTACH_CAP):
     or a pipe, passes the bytes through untouched.
 
     Truncation is announced rather than silent: a quietly halved attachment looks
-    exactly like a model that ignored half of it."""
-    chunks = []
+    exactly like a model that ignored half of it.
+
+    A named file that is not there is fatal, and the first version only warned.
+    Measured, and it is the worst output this mode has produced: `-f
+    ~/suggestion.txt "how can we do this in dipper?"` with no such file asked
+    "how can we do this" about nothing at all, and got back a fluent paragraph
+    saying dipper downloads torrents, correctly cited to a doc comment. Every
+    deterministic check passed, because every check tests the answer and the
+    fault was in the question. A precondition the harness can test is not left
+    to the model to notice."""
+    chunks, missing = [], []
     for path in paths or ():
         f = Path(path)
         if not f.is_file():
-            print(f"attachment not found, skipping: {path}")
+            missing.append(str(f))
             continue
         chunks.append((str(f), f.read_text(errors="replace")))
     if not sys.stdin.isatty():
@@ -1870,7 +1879,7 @@ def read_attachment(paths, cap=ATTACH_CAP):
             print(f"attachment {name}: {len(text)} characters, using the first {cap}")
             text = text[:cap] + "\n... [truncated by the harness]"
         out.append((name, text))
-    return out
+    return out, missing
 
 
 def carry_context(repo: Path, sessions=3):
@@ -2241,7 +2250,11 @@ def main():
         return 1 if bad else 0
 
     if a.ask or a.attach or not sys.stdin.isatty():
-        attached = read_attachment(a.attach)
+        attached, missing = read_attachment(a.attach)
+        if missing:
+            print("attachment not found: " + ", ".join(missing))
+            print("refusing to run: the question was written to be read alongside it")
+            return 2
         question = a.ask or ("Explain the text supplied with this question, in the "
                              "context of this repository.")
         if not a.ask and not attached:
