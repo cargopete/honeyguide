@@ -1,0 +1,34 @@
+# yatr - https://github.com/cargopete/yatr
+
+[env]
+CARGO_TERM_COLOR = "always"
+
+[settings]
+cache = true
+
+[tasks.fmt]
+desc = "Format the tree"
+run = ["cargo fmt --all"]
+no_cache = true
+
+[tasks.fmt-check]
+desc = "Fail if the tree is unformatted"
+run = ["cargo fmt --all --check"]
+sources = ["crates/**/*.rs"]
+
+# Cargo.lock is gitignored here, so it is named to be hashed.
+[tasks.lint]
+desc = "Clippy with warnings denied"
+run = ["cargo clippy --workspace --all-targets -- -D warnings"]
+sources = ["crates/**", "Cargo.toml", "Cargo.lock"]
+
+[tasks.test]
+desc = "The workspace tests"
+run = ["cargo test --workspace"]
+sources = ["crates/**", "Cargo.toml", "Cargo.lock"]
+watch = ["crates/**"]
+
+[tasks.ci]
+desc = "fmt-check, lint, test"
+depends = ["fmt-check", "lint", "test"]
+run = []
